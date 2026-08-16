@@ -1,7 +1,7 @@
 # 02 — In-Memory Store
 
 > **Stage:** 1  
-> **Status:** 🔲 Planned. This document describes the design before implementation begins.
+> **Status:** ✅ Complete. Stage 1 is tagged `v0.1.0` and fully verified.
 
 ---
 
@@ -160,9 +160,11 @@ These are not bugs in Stage 1 — they are deliberately deferred to keep the ini
 
 ## What Stage 2 Adds
 
-Stage 2 (Storage Abstraction) wraps this concrete `unordered_map` implementation behind an interface. The rest of the engine will then depend on the interface, not the map. This makes it possible to swap the backing implementation in the future without touching the WAL, recovery, or HTTP layers.
+Stage 2 (Storage Abstraction) wraps this concrete `unordered_map` implementation behind an interface. `KeyValueStore` now depends on the `Storage` interface, not on `std::unordered_map` directly. `InMemoryStorage` provides the default concrete implementation. This makes it possible to swap the backing store in future stages without touching `KeyValueStore`'s public API or any code that depends on it.
+
+See [02-storage-abstraction.md](02-storage-abstraction.md) for the full Stage 2 design.
 
 ---
 
 *Previous: [01-project-overview.md](01-project-overview.md)*  
-*Next: [03-write-ahead-log.md](03-write-ahead-log.md)*
+*Next: [02-storage-abstraction.md](02-storage-abstraction.md)*

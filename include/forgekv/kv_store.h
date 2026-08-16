@@ -1,24 +1,56 @@
 #pragma once
 
 // =============================================================================
-// ForgeKV — Stage 1: In-Memory Key-Value Store
+// ForgeKV — Stage 2: KeyValueStore (Storage-Abstraction refactor)
 // =============================================================================
 //
-// KeyValueStore is the core abstraction of ForgeKV. It maps string keys to
-// string values and supports four operations: set, get, del, exists.
+// KeyValueStore is the public-facing engine of ForgeKV. It maps string keys to
+// string values and exposes the same API as Stage 1.
 //
-// At Stage 1, all data lives in RAM. There is no persistence, no WAL, no
-// networking, and no concurrency support. Those are added in later stages.
+// Stage 1 vs Stage 2 — the key change:
 //
-// Internal representation: std::unordered_map<std::string, std::string>
-// The map is private. External code never interacts with it directly.
+//   Stage 1:
+//     KeyValueStore owned an unordered_map directly.
+//
+//   Stage 2:
+//     KeyValueStore owns a std::unique_ptr<Storage> and delegates all
+//     storage operations through the interface. The concrete backing
+//     store is hidden behind the pointer.
+//
+// Architecture:
+//
+//   KeyValueStore
+//         │
+//         ▼
+//     Storage  (abstract interface — include/forgekv/storage.h)
+//         │
+//         ▼
+//   InMemoryStorage  (default — wraps std::unordered_map)
+//
+// Default construction:
+//   KeyValueStore store;
+//   → automatically creates an InMemoryStorage as the backing store.
+//   → existing Stage 1 code needs no changes.
+//
+// Dependency injection constructor:
+//   KeyValueStore store(std::make_unique<SomeOtherStorage>(...));
+//   → allows alternative implementations to be supplied.
+//   → used in Stage 2 tests to verify the abstraction with a fake store.
+//   → will be used in future stages (WAL-backed storage, etc.).
+//
+// Ownership model:
+//   KeyValueStore owns the storage exclusively via unique_ptr.
+//   It is not copyable (shared ownership would be non-obvious and rarely
+//   correct). Move is allowed.
 //
 // Thread safety: NOT thread-safe at this stage. Stage 7 adds synchronization.
 // =============================================================================
 
+#include "forgekv/storage.h"
+
+#include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
 
 namespace forgekv {
 
@@ -28,7 +60,15 @@ public:
     // Construction
     // -------------------------------------------------------------------------
 
-    KeyValueStore()  = default;
+    // Default constructor — creates an InMemoryStorage backing store.
+    // This is the normal construction path; existing code requires no changes.
+    KeyValueStore();
+
+    // Dependency-injection constructor — accepts any Storage implementation.
+    // Takes ownership of the storage pointer.
+    // Precondition: storage must not be null.
+    explicit KeyValueStore(std::unique_ptr<Storage> storage);
+
     ~KeyValueStore() = default;
 
     // Not copyable — copying a store would silently duplicate all data,
@@ -43,21 +83,16 @@ public:
     // Core operations
     // -------------------------------------------------------------------------
 
-    // SET: Store value under key. If the key already exists, its value is
-    // overwritten (upsert semantics). Both empty strings are valid.
+    // SET: Store value under key. Overwrites if key already exists (upsert).
     void set(const std::string& key, const std::string& value);
 
-    // GET: Return the value for key, or std::nullopt if the key is absent.
-    // Does not modify the store.
+    // GET: Return value for key, or nullopt if absent. No side effects.
     [[nodiscard]] std::optional<std::string> get(const std::string& key) const;
 
-    // DEL: Remove key and its value. Safe to call on a key that does not
-    // exist — it is a no-op in that case.
-    // Returns true if the key existed and was removed, false otherwise.
+    // DEL: Remove key and value. Returns true if key existed, false otherwise.
     bool del(const std::string& key);
 
-    // EXISTS: Return true if the key is present, false if it is not.
-    // Does not modify the store.
+    // EXISTS: Return true if key is present. No side effects.
     [[nodiscard]] bool exists(const std::string& key) const;
 
     // -------------------------------------------------------------------------
@@ -74,9 +109,10 @@ public:
     void clear();
 
 private:
-    // The backing data structure. Private: no external code touches this.
-    // std::unordered_map provides O(1) average for all four core operations.
-    std::unordered_map<std::string, std::string> store_;
+    // Backing storage — owned exclusively by this KeyValueStore instance.
+    // Constructed at build time (default: InMemoryStorage) or injected.
+    // Never null after construction.
+    std::unique_ptr<Storage> storage_;
 };
 
 } // namespace forgekv

@@ -296,6 +296,297 @@ TEST(many_keys) {
 }
 
 // =============================================================================
+// Stage 2 tests — Storage Abstraction
+// =============================================================================
+//
+// These tests verify:
+//   1. InMemoryStorage works correctly in isolation.
+//   2. InMemoryStorage is correctly accessible through the Storage interface.
+//   3. KeyValueStore still satisfies all Stage 1 contracts through the
+//      storage abstraction layer.
+//   4. KeyValueStore accepts a custom Storage implementation via injection,
+//      demonstrating the abstraction is real (using a minimal fake store).
+// =============================================================================
+
+#include "forgekv/storage.h"
+#include "forgekv/in_memory_storage.h"
+
+// -----------------------------------------------------------------------------
+// Minimal fake Storage implementation
+// -----------------------------------------------------------------------------
+// FakeStorage is a stand-alone Storage that always reports empty and no-ops
+// on all writes. Its only purpose is to prove that KeyValueStore accepts
+// *any* Storage, not just InMemoryStorage. No external mocking library needed.
+// -----------------------------------------------------------------------------
+
+class FakeStorage final : public forgekv::Storage {
+public:
+    // Counts how many times each method was called — lets tests verify
+    // that KeyValueStore is actually forwarding calls to storage_.
+    mutable int set_calls    = 0;
+    mutable int get_calls    = 0;
+    mutable int del_calls    = 0;
+    mutable int exists_calls = 0;
+    mutable int size_calls   = 0;
+    mutable int empty_calls  = 0;
+    mutable int clear_calls  = 0;
+
+    void set(const std::string&, const std::string&) override { ++set_calls; }
+
+    std::optional<std::string> get(const std::string&) const override {
+        ++get_calls;
+        return std::nullopt;
+    }
+
+    bool del(const std::string&) override { ++del_calls; return false; }
+
+    bool exists(const std::string&) const override {
+        ++exists_calls;
+        return false;
+    }
+
+    std::size_t size() const override { ++size_calls; return 0; }
+
+    bool empty() const override { ++empty_calls; return true; }
+
+    void clear() override { ++clear_calls; }
+};
+
+// =============================================================================
+// InMemoryStorage — standalone tests (not through KeyValueStore)
+// =============================================================================
+
+// S2-1. InMemoryStorage basic set/get round-trip
+TEST(storage_set_then_get) {
+    forgekv::InMemoryStorage s;
+    s.set("key", "value");
+    auto result = s.get("key");
+    ASSERT_HAS_VALUE(result);
+    ASSERT_EQ(*result, "value");
+}
+
+// S2-2. InMemoryStorage — update (overwrite) existing key
+TEST(storage_update_key) {
+    forgekv::InMemoryStorage s;
+    s.set("lang", "C");
+    s.set("lang", "C++");
+    auto result = s.get("lang");
+    ASSERT_HAS_VALUE(result);
+    ASSERT_EQ(*result, "C++");
+    ASSERT_EQ(s.size(), std::size_t{1});
+}
+
+// S2-3. InMemoryStorage — get missing key returns nullopt
+TEST(storage_get_missing) {
+    forgekv::InMemoryStorage s;
+    ASSERT_NO_VALUE(s.get("absent"));
+}
+
+// S2-4. InMemoryStorage — del existing key returns true, key gone
+TEST(storage_del_existing) {
+    forgekv::InMemoryStorage s;
+    s.set("x", "1");
+    ASSERT_TRUE(s.del("x"));
+    ASSERT_NO_VALUE(s.get("x"));
+    ASSERT_EQ(s.size(), std::size_t{0});
+}
+
+// S2-5. InMemoryStorage — del missing key returns false, no crash
+TEST(storage_del_missing) {
+    forgekv::InMemoryStorage s;
+    ASSERT_FALSE(s.del("ghost"));
+}
+
+// S2-6. InMemoryStorage — exists
+TEST(storage_exists) {
+    forgekv::InMemoryStorage s;
+    ASSERT_FALSE(s.exists("k"));
+    s.set("k", "v");
+    ASSERT_TRUE(s.exists("k"));
+    s.del("k");
+    ASSERT_FALSE(s.exists("k"));
+}
+
+// S2-7. InMemoryStorage — size and empty
+TEST(storage_size_and_empty) {
+    forgekv::InMemoryStorage s;
+    ASSERT_TRUE(s.empty());
+    ASSERT_EQ(s.size(), std::size_t{0});
+
+    s.set("a", "1");
+    ASSERT_FALSE(s.empty());
+    ASSERT_EQ(s.size(), std::size_t{1});
+
+    s.set("b", "2");
+    ASSERT_EQ(s.size(), std::size_t{2});
+
+    s.del("a");
+    ASSERT_EQ(s.size(), std::size_t{1});
+
+    s.clear();
+    ASSERT_TRUE(s.empty());
+    ASSERT_EQ(s.size(), std::size_t{0});
+}
+
+// S2-8. InMemoryStorage — clear removes all entries
+TEST(storage_clear) {
+    forgekv::InMemoryStorage s;
+    s.set("p", "1");
+    s.set("q", "2");
+    s.set("r", "3");
+    s.clear();
+    ASSERT_TRUE(s.empty());
+    ASSERT_NO_VALUE(s.get("p"));
+    ASSERT_NO_VALUE(s.get("q"));
+    ASSERT_NO_VALUE(s.get("r"));
+}
+
+// =============================================================================
+// InMemoryStorage through the Storage interface (base pointer)
+// =============================================================================
+// These tests verify that the vtable dispatch works correctly — i.e. calling
+// through a Storage* actually reaches InMemoryStorage's implementations.
+
+// S2-9. set/get through Storage pointer
+TEST(storage_interface_set_get) {
+    std::unique_ptr<forgekv::Storage> s =
+        std::make_unique<forgekv::InMemoryStorage>();
+    s->set("hello", "world");
+    auto result = s->get("hello");
+    ASSERT_HAS_VALUE(result);
+    ASSERT_EQ(*result, "world");
+}
+
+// S2-10. del/exists through Storage pointer
+TEST(storage_interface_del_exists) {
+    std::unique_ptr<forgekv::Storage> s =
+        std::make_unique<forgekv::InMemoryStorage>();
+    s->set("tmp", "data");
+    ASSERT_TRUE(s->exists("tmp"));
+    ASSERT_TRUE(s->del("tmp"));
+    ASSERT_FALSE(s->exists("tmp"));
+}
+
+// S2-11. size/empty/clear through Storage pointer
+TEST(storage_interface_size_empty_clear) {
+    std::unique_ptr<forgekv::Storage> s =
+        std::make_unique<forgekv::InMemoryStorage>();
+    ASSERT_TRUE(s->empty());
+    s->set("a", "1");
+    s->set("b", "2");
+    ASSERT_EQ(s->size(), std::size_t{2});
+    s->clear();
+    ASSERT_TRUE(s->empty());
+}
+
+// =============================================================================
+// KeyValueStore through the abstraction — Stage 1 contracts still hold
+// =============================================================================
+
+// S2-12. KeyValueStore default ctor — still works the same as Stage 1
+TEST(kv_default_ctor_still_works) {
+    forgekv::KeyValueStore store;
+    store.set("stage", "2");
+    ASSERT_EQ(*store.get("stage"), "2");
+    ASSERT_TRUE(store.exists("stage"));
+    ASSERT_EQ(store.size(), std::size_t{1});
+    store.del("stage");
+    ASSERT_FALSE(store.exists("stage"));
+    ASSERT_TRUE(store.empty());
+}
+
+// S2-13. KeyValueStore — updating existing key still works through abstraction
+TEST(kv_update_through_abstraction) {
+    forgekv::KeyValueStore store;
+    store.set("k", "old");
+    store.set("k", "new");
+    ASSERT_EQ(*store.get("k"), "new");
+    ASSERT_EQ(store.size(), std::size_t{1});
+}
+
+// S2-14. KeyValueStore — clear through abstraction
+TEST(kv_clear_through_abstraction) {
+    forgekv::KeyValueStore store;
+    store.set("x", "1");
+    store.set("y", "2");
+    store.clear();
+    ASSERT_TRUE(store.empty());
+    ASSERT_NO_VALUE(store.get("x"));
+}
+
+// S2-15. KeyValueStore — missing key returns nullopt through abstraction
+TEST(kv_missing_key_through_abstraction) {
+    forgekv::KeyValueStore store;
+    ASSERT_NO_VALUE(store.get("absent"));
+    ASSERT_FALSE(store.exists("absent"));
+}
+
+// S2-16. KeyValueStore — del missing key is safe through abstraction
+TEST(kv_del_missing_through_abstraction) {
+    forgekv::KeyValueStore store;
+    ASSERT_FALSE(store.del("no-such-key"));
+    ASSERT_EQ(store.size(), std::size_t{0});
+}
+
+// =============================================================================
+// Dependency injection — FakeStorage
+// =============================================================================
+
+// S2-17. KeyValueStore forwards set() to the injected storage
+TEST(di_forwards_set) {
+    auto* fake = new FakeStorage();   // raw ptr so we can inspect counts
+    auto ptr   = std::unique_ptr<forgekv::Storage>(fake);
+    forgekv::KeyValueStore store(std::move(ptr));
+    store.set("k", "v");
+    ASSERT_EQ(fake->set_calls, 1);
+}
+
+// S2-18. KeyValueStore forwards get() to the injected storage
+TEST(di_forwards_get) {
+    auto* fake = new FakeStorage();
+    auto ptr   = std::unique_ptr<forgekv::Storage>(fake);
+    forgekv::KeyValueStore store(std::move(ptr));
+    auto result = store.get("k");
+    ASSERT_NO_VALUE(result);      // FakeStorage always returns nullopt
+    ASSERT_EQ(fake->get_calls, 1);
+}
+
+// S2-19. KeyValueStore forwards del() to the injected storage
+TEST(di_forwards_del) {
+    auto* fake = new FakeStorage();
+    auto ptr   = std::unique_ptr<forgekv::Storage>(fake);
+    forgekv::KeyValueStore store(std::move(ptr));
+    bool removed = store.del("k");
+    ASSERT_FALSE(removed);        // FakeStorage always returns false
+    ASSERT_EQ(fake->del_calls, 1);
+}
+
+// S2-20. KeyValueStore forwards exists() to the injected storage
+TEST(di_forwards_exists) {
+    auto* fake = new FakeStorage();
+    auto ptr   = std::unique_ptr<forgekv::Storage>(fake);
+    forgekv::KeyValueStore store(std::move(ptr));
+    bool found = store.exists("k");
+    ASSERT_FALSE(found);          // FakeStorage always returns false
+    ASSERT_EQ(fake->exists_calls, 1);
+}
+
+// S2-21. KeyValueStore forwards size()/empty()/clear() to the injected storage
+TEST(di_forwards_utility_methods) {
+    auto* fake = new FakeStorage();
+    auto ptr   = std::unique_ptr<forgekv::Storage>(fake);
+    forgekv::KeyValueStore store(std::move(ptr));
+
+    ASSERT_EQ(store.size(), std::size_t{0});
+    ASSERT_TRUE(store.empty());
+    store.clear();
+
+    ASSERT_EQ(fake->size_calls,  1);
+    ASSERT_EQ(fake->empty_calls, 1);
+    ASSERT_EQ(fake->clear_calls, 1);
+}
+
+// =============================================================================
 // Test runner
 // =============================================================================
 

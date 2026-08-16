@@ -33,6 +33,7 @@ message(STATUS "Compiler         : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER
 
 add_library(forgekv_core STATIC
     src/kv_store.cpp
+    src/in_memory_storage.cpp   # Stage 2: InMemoryStorage implementation
 )
 
 # PUBLIC: anything that links forgekv_core also gets this include path.
@@ -61,7 +62,7 @@ target_link_libraries(forgekv_tests PRIVATE forgekv_core)
 
 # Enable CTest integration so `ctest` discovers and runs the binary.
 enable_testing()
-add_test(NAME forgekv_stage1_tests COMMAND forgekv_tests)
+add_test(NAME forgekv_all_tests COMMAND forgekv_tests)
 
 # ---------------------------------------------------------------------------
 # forgekv_demo — Stage 1 example / demo binary
@@ -74,13 +75,24 @@ add_executable(forgekv_demo
 target_link_libraries(forgekv_demo PRIVATE forgekv_core)
 
 # ---------------------------------------------------------------------------
+# forgekv_demo1 — Stage 1 interactive example
+# ---------------------------------------------------------------------------
+
+add_executable(forgekv_demo1
+    examples/demo1.cpp
+)
+
+target_link_libraries(forgekv_demo1 PRIVATE forgekv_core)
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 message(STATUS "")
 message(STATUS "Targets configured:")
-message(STATUS "  forgekv_core   — static library (src/kv_store.cpp)")
+message(STATUS "  forgekv_core   — static library (src/kv_store.cpp, src/in_memory_storage.cpp)")
 message(STATUS "  forgekv_tests  — test binary    (tests/test_kv_store.cpp)")
 message(STATUS "  forgekv_demo   — demo binary    (examples/demo.cpp)")
+message(STATUS "  forgekv_demo1  — demo binary    (examples/demo1.cpp)")
 message(STATUS "")
 message(STATUS "Build:      cmake --build build")
 message(STATUS "Run tests:  ctest --test-dir build --output-on-failure")
