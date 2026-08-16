@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     ForgeKV
-    VERSION 0.1.0
+    VERSION 0.3.0
     DESCRIPTION "A persistent, concurrent key-value storage engine built from scratch in C++20"
     LANGUAGES CXX
 )
@@ -25,20 +25,18 @@ message(STATUS "C++ standard     : C++${CMAKE_CXX_STANDARD}")
 message(STATUS "Compiler         : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 
 # ---------------------------------------------------------------------------
-# forgekv_core — static library (Stage 1)
+# forgekv_core — static library
 # ---------------------------------------------------------------------------
 # All ForgeKV implementation files are compiled into this library.
 # Both the test binary and the demo binary link against it.
-# As new stages add files to src/, they are added here.
 
 add_library(forgekv_core STATIC
     src/kv_store.cpp
     src/in_memory_storage.cpp   # Stage 2: InMemoryStorage implementation
+    src/wal.cpp                 # Stage 3: Write-Ahead Log implementation
 )
 
 # PUBLIC: anything that links forgekv_core also gets this include path.
-# This lets #include "forgekv/kv_store.h" work without specifying the full
-# path in every translation unit.
 target_include_directories(forgekv_core PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
@@ -50,9 +48,8 @@ target_compile_options(forgekv_core PRIVATE
 )
 
 # ---------------------------------------------------------------------------
-# forgekv_tests — Stage 1 test binary
+# forgekv_tests — test binary (Stage 1 + Stage 2 + Stage 3)
 # ---------------------------------------------------------------------------
-# Self-contained test harness — no external test framework required.
 
 add_executable(forgekv_tests
     tests/test_kv_store.cpp
@@ -89,7 +86,7 @@ target_link_libraries(forgekv_demo1 PRIVATE forgekv_core)
 # ---------------------------------------------------------------------------
 message(STATUS "")
 message(STATUS "Targets configured:")
-message(STATUS "  forgekv_core   — static library (src/kv_store.cpp, src/in_memory_storage.cpp)")
+message(STATUS "  forgekv_core   — static library (kv_store.cpp, in_memory_storage.cpp, wal.cpp)")
 message(STATUS "  forgekv_tests  — test binary    (tests/test_kv_store.cpp)")
 message(STATUS "  forgekv_demo   — demo binary    (examples/demo.cpp)")
 message(STATUS "  forgekv_demo1  — demo binary    (examples/demo1.cpp)")
@@ -102,5 +99,5 @@ message(STATUS "")
 # ---------------------------------------------------------------------------
 # Future subdirectory stubs (uncommented as each stage is implemented)
 # ---------------------------------------------------------------------------
-# Stage 3+:  WAL, recovery, HTTP, concurrency, snapshots, compaction, TTL
+# Stage 4+:  binary WAL, recovery, HTTP, concurrency, snapshots, compaction, TTL
 # Stage 12:  add_subdirectory(benchmarks)

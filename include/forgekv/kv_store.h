@@ -1,52 +1,62 @@
 #pragma once
 
 // =============================================================================
-// ForgeKV — Stage 2: KeyValueStore (Storage-Abstraction refactor)
+// ForgeKV — Stage 3: KeyValueStore (WAL integration)
 // =============================================================================
 //
 // KeyValueStore is the public-facing engine of ForgeKV. It maps string keys to
 // string values and exposes the same API as Stage 1.
 //
-// Stage 1 vs Stage 2 — the key change:
-//
-//   Stage 1:
-//     KeyValueStore owned an unordered_map directly.
-//
-//   Stage 2:
-//     KeyValueStore owns a std::unique_ptr<Storage> and delegates all
-//     storage operations through the interface. The concrete backing
-//     store is hidden behind the pointer.
+// Stage 1: KeyValueStore owned an unordered_map directly.
+// Stage 2: KeyValueStore owns a std::unique_ptr<Storage> and delegates all
+//          storage operations through the interface.
+// Stage 3: KeyValueStore also owns a std::unique_ptr<WAL>. Every mutating
+//          operation writes a WAL record BEFORE touching in-memory storage.
 //
 // Architecture:
 //
-//   KeyValueStore
-//         │
-//         ▼
-//     Storage  (abstract interface — include/forgekv/storage.h)
-//         │
-//         ▼
-//   InMemoryStorage  (default — wraps std::unordered_map)
+//                   KeyValueStore
+//                  /             \
+//                 /               \
+//                v                 v
+//            Storage             WAL
+//                |                 |
+//                v                 v
+//        InMemoryStorage      forgekv.wal (text)
+//                |
+//                v
+//          unordered_map
+//
+// Write ordering (Stage 3 invariant):
+//
+//   KeyValueStore::set()   → WAL::append_set()   → Storage::set()
+//   KeyValueStore::del()   → WAL::append_del()   → Storage::del()
+//   KeyValueStore::clear() → WAL::append_clear() → Storage::clear()
+//
+//   If a WAL write throws, the in-memory state is NOT changed.
+//   The exception propagates to the caller.
+//
+// Read operations (get, exists, size, empty) do NOT write to the WAL.
 //
 // Default construction:
 //   KeyValueStore store;
-//   → automatically creates an InMemoryStorage as the backing store.
-//   → existing Stage 1 code needs no changes.
+//   → creates InMemoryStorage and opens WAL at "forgekv.wal".
+//   → existing Stage 1 and Stage 2 code needs no changes.
 //
-// Dependency injection constructor:
-//   KeyValueStore store(std::make_unique<SomeOtherStorage>(...));
-//   → allows alternative implementations to be supplied.
-//   → used in Stage 2 tests to verify the abstraction with a fake store.
-//   → will be used in future stages (WAL-backed storage, etc.).
+// Full dependency-injection constructor:
+//   KeyValueStore store(std::move(storage), std::move(wal));
+//   → accepts any Storage and any WAL.
+//   → used in Stage 3 tests with a test-specific WAL path.
 //
 // Ownership model:
-//   KeyValueStore owns the storage exclusively via unique_ptr.
-//   It is not copyable (shared ownership would be non-obvious and rarely
-//   correct). Move is allowed.
+//   KeyValueStore owns both storage_ and wal_ exclusively via unique_ptr.
+//   It is not copyable. Move is allowed.
 //
 // Thread safety: NOT thread-safe at this stage. Stage 7 adds synchronization.
 // =============================================================================
 
 #include "forgekv/storage.h"
+#include "forgekv/wal.h"
 
 #include <memory>
 #include <optional>
@@ -60,19 +70,26 @@ public:
     // Construction
     // -------------------------------------------------------------------------
 
-    // Default constructor — creates an InMemoryStorage backing store.
-    // This is the normal construction path; existing code requires no changes.
+    // Default constructor — creates InMemoryStorage and opens WAL at
+    // "forgekv.wal" in the current working directory.
+    // Throws std::runtime_error if the WAL file cannot be opened.
     KeyValueStore();
 
-    // Dependency-injection constructor — accepts any Storage implementation.
-    // Takes ownership of the storage pointer.
-    // Precondition: storage must not be null.
+    // Full dependency-injection constructor — accepts any Storage and WAL.
+    // Takes ownership of both pointers.
+    // Throws std::invalid_argument if storage or wal is null.
+    explicit KeyValueStore(std::unique_ptr<Storage> storage,
+                           std::unique_ptr<WAL>     wal);
+
+    // Storage-only injection (convenience overload) — creates a default WAL
+    // at "forgekv.wal". Kept for backward compatibility with Stage 2 tests
+    // that inject only a Storage. The WAL is still opened and will be written
+    // to on every mutation.
     explicit KeyValueStore(std::unique_ptr<Storage> storage);
 
     ~KeyValueStore() = default;
 
-    // Not copyable — copying a store would silently duplicate all data,
-    // which is rarely intentional. Move is allowed.
+    // Not copyable. Move is allowed.
     KeyValueStore(const KeyValueStore&)            = delete;
     KeyValueStore& operator=(const KeyValueStore&) = delete;
 
@@ -83,36 +100,41 @@ public:
     // Core operations
     // -------------------------------------------------------------------------
 
-    // SET: Store value under key. Overwrites if key already exists (upsert).
+    // SET: WAL append_set, then Storage::set. Upsert semantics.
+    // Throws std::runtime_error if the WAL write fails (in-memory unchanged).
     void set(const std::string& key, const std::string& value);
 
-    // GET: Return value for key, or nullopt if absent. No side effects.
+    // GET: Storage::get only. No WAL interaction.
     [[nodiscard]] std::optional<std::string> get(const std::string& key) const;
 
-    // DEL: Remove key and value. Returns true if key existed, false otherwise.
+    // DEL: If key exists: WAL append_del, then Storage::del. Returns true.
+    //      If key does not exist: returns false. No WAL record is written.
+    // Throws std::runtime_error if the WAL write fails (in-memory unchanged).
     bool del(const std::string& key);
 
-    // EXISTS: Return true if key is present. No side effects.
+    // EXISTS: Storage::exists only. No WAL interaction.
     [[nodiscard]] bool exists(const std::string& key) const;
 
     // -------------------------------------------------------------------------
     // Utility
     // -------------------------------------------------------------------------
 
-    // Return the number of key-value pairs currently in the store.
+    // SIZE: Storage::size only. No WAL interaction.
     [[nodiscard]] std::size_t size() const;
 
-    // Return true if the store contains no key-value pairs.
+    // EMPTY: Storage::empty only. No WAL interaction.
     [[nodiscard]] bool empty() const;
 
-    // Remove all key-value pairs from the store.
+    // CLEAR: WAL append_clear, then Storage::clear.
+    // Throws std::runtime_error if the WAL write fails (in-memory unchanged).
     void clear();
 
 private:
-    // Backing storage — owned exclusively by this KeyValueStore instance.
-    // Constructed at build time (default: InMemoryStorage) or injected.
-    // Never null after construction.
+    // Backing storage — owned exclusively. Never null after construction.
     std::unique_ptr<Storage> storage_;
+
+    // Write-ahead log — owned exclusively. Never null after construction.
+    std::unique_ptr<WAL> wal_;
 };
 
 } // namespace forgekv

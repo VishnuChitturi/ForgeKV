@@ -1,5 +1,5 @@
 // =============================================================================
-// ForgeKV — Stage 1: KeyValueStore tests
+// ForgeKV — Stage 1 + Stage 2 + Stage 3: KeyValueStore tests
 // =============================================================================
 //
 // Minimal self-contained test harness — no external framework required.
@@ -13,13 +13,21 @@
 // ASSERT_FALSE(cond)       — fail if cond is true
 // ASSERT_HAS_VALUE(opt)    — fail if optional is empty
 // ASSERT_NO_VALUE(opt)     — fail if optional has a value
+// ASSERT_THROWS(expr)      — fail if expr does NOT throw
 // =============================================================================
 
 #include "forgekv/kv_store.h"
+#include "forgekv/storage.h"
+#include "forgekv/in_memory_storage.h"
+#include "forgekv/wal.h"
 
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -88,19 +96,29 @@ struct AssertionFailure {
         }                                                                     \
     } while (false)
 
+// ASSERT_THROWS: verify that an expression throws any std::exception.
+// Fails if the expression completes without throwing.
+#define ASSERT_THROWS(expr)                                                  \
+    do {                                                                      \
+        bool threw = false;                                                   \
+        try { (expr); }                                                       \
+        catch (const std::exception&) { threw = true; }                      \
+        catch (...) { threw = true; }                                         \
+        if (!threw) {                                                         \
+            throw AssertionFailure{                                           \
+                "ASSERT_THROWS failed: expression did not throw: " #expr     \
+                " (line " + std::to_string(__LINE__) + ")"};                 \
+        }                                                                     \
+    } while (false)
+
 // Registers a test function and runs it by name later.
 #define TEST(name)                                                            \
     static void test_##name();                                                \
     static TestRegistrar registrar_##name{#name, test_##name};               \
     static void test_##name()
 
-// -----------------------------------------------------------------------------
-// Helper: fresh store per test (avoids shared mutable state between tests)
-// -----------------------------------------------------------------------------
-// Each test constructs its own local KeyValueStore. There is no global store.
-
 // =============================================================================
-// Tests
+// Stage 1 Tests
 // =============================================================================
 
 // 1. SET followed by GET — fundamental round-trip
@@ -308,9 +326,6 @@ TEST(many_keys) {
 //      demonstrating the abstraction is real (using a minimal fake store).
 // =============================================================================
 
-#include "forgekv/storage.h"
-#include "forgekv/in_memory_storage.h"
-
 // -----------------------------------------------------------------------------
 // Minimal fake Storage implementation
 // -----------------------------------------------------------------------------
@@ -444,8 +459,6 @@ TEST(storage_clear) {
 // =============================================================================
 // InMemoryStorage through the Storage interface (base pointer)
 // =============================================================================
-// These tests verify that the vtable dispatch works correctly — i.e. calling
-// through a Storage* actually reaches InMemoryStorage's implementations.
 
 // S2-9. set/get through Storage pointer
 TEST(storage_interface_set_get) {
@@ -534,7 +547,7 @@ TEST(kv_del_missing_through_abstraction) {
 
 // S2-17. KeyValueStore forwards set() to the injected storage
 TEST(di_forwards_set) {
-    auto* fake = new FakeStorage();   // raw ptr so we can inspect counts
+    auto* fake = new FakeStorage();
     auto ptr   = std::unique_ptr<forgekv::Storage>(fake);
     forgekv::KeyValueStore store(std::move(ptr));
     store.set("k", "v");
@@ -551,14 +564,24 @@ TEST(di_forwards_get) {
     ASSERT_EQ(fake->get_calls, 1);
 }
 
-// S2-19. KeyValueStore forwards del() to the injected storage
+// S2-19. KeyValueStore del() on a missing key — does NOT forward to storage.
+//
+// Stage 3 design: del() checks storage_->exists() first.
+// If the key is absent, del() returns false immediately without calling
+// storage_->del(). This is because del() only writes a WAL record (and
+// only removes from storage) when the key actually exists — a delete of a
+// non-existent key is a no-op that does not change state.
+//
+// Consequence for FakeStorage (which always returns false from exists()):
+// del_calls remains 0, and exists_calls is 1.
 TEST(di_forwards_del) {
     auto* fake = new FakeStorage();
     auto ptr   = std::unique_ptr<forgekv::Storage>(fake);
     forgekv::KeyValueStore store(std::move(ptr));
     bool removed = store.del("k");
-    ASSERT_FALSE(removed);        // FakeStorage always returns false
-    ASSERT_EQ(fake->del_calls, 1);
+    ASSERT_FALSE(removed);             // key not present — del is a no-op
+    ASSERT_EQ(fake->exists_calls, 1);  // exists() was checked
+    ASSERT_EQ(fake->del_calls, 0);     // del() not forwarded when key absent
 }
 
 // S2-20. KeyValueStore forwards exists() to the injected storage
@@ -587,6 +610,417 @@ TEST(di_forwards_utility_methods) {
 }
 
 // =============================================================================
+// Stage 3 tests — Write-Ahead Log (WAL)
+// =============================================================================
+//
+// These tests verify:
+//   1. WAL creates a file if it does not exist.
+//   2. SET appends the expected textual record (SET|key|value).
+//   3. Multiple SET operations append in order.
+//   4. DEL appends the expected record (DEL|key).
+//   5. CLEAR appends the CLEAR record.
+//   6. Existing WAL contents are preserved when reopening.
+//   7. KeyValueStore::set() writes to WAL before updating Storage.
+//   8. KeyValueStore::del() writes the correct WAL record.
+//   9. Read-only operations do NOT append WAL entries.
+//  10. WAL write failures propagate; in-memory state is NOT mutated.
+//  11. Full DI constructor: storage + WAL injected together.
+//  12. del() on a non-existent key does NOT write a WAL record.
+//
+// All tests use temporary file paths and clean up on exit.
+// The std::filesystem library (C++17/20) is used for reliable cleanup.
+// =============================================================================
+
+// Helper: read the entire content of a file into a string.
+static std::string read_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        throw std::runtime_error("read_file: cannot open: " + path);
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// Helper: RAII guard that deletes a file on scope exit.
+// Ensures test files are always cleaned up even when a test throws.
+struct TempFile {
+    std::string path;
+    explicit TempFile(std::string p) : path(std::move(p)) {}
+    ~TempFile() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        // Ignore errors — file may not exist if test failed early.
+    }
+};
+
+// Unique temp WAL path per test — avoids collisions when tests run in the
+// same process. Uses __LINE__ to guarantee uniqueness across tests.
+#define TEMP_WAL(name) \
+    TempFile name{"test_wal_" #name ".wal"}
+
+// ---------------------------------------------------------------------------
+// S3-1. WAL creates a new file if it does not exist.
+// ---------------------------------------------------------------------------
+TEST(s3_wal_creates_file) {
+    TEMP_WAL(guard);
+    // Ensure the file does not already exist
+    std::filesystem::remove(guard.path);
+
+    {
+        forgekv::WAL wal(guard.path);
+        // Simply opening the WAL should create the file
+    }
+
+    ASSERT_TRUE(std::filesystem::exists(guard.path));
+}
+
+// ---------------------------------------------------------------------------
+// S3-2. SET appends a correctly formatted record: "SET|key|value\n"
+// ---------------------------------------------------------------------------
+TEST(s3_set_record_format) {
+    TEMP_WAL(guard);
+
+    {
+        forgekv::WAL wal(guard.path);
+        wal.append_set("name", "Vishnu");
+    }
+
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content, "SET|name|Vishnu\n");
+}
+
+// ---------------------------------------------------------------------------
+// S3-3. Multiple SET operations append records in order.
+// ---------------------------------------------------------------------------
+TEST(s3_multiple_sets_in_order) {
+    TEMP_WAL(guard);
+
+    {
+        forgekv::WAL wal(guard.path);
+        wal.append_set("name", "Vishnu");
+        wal.append_set("age",  "21");
+        wal.append_set("city", "Bengaluru");
+    }
+
+    const std::string content = read_file(guard.path);
+    const std::string expected =
+        "SET|name|Vishnu\n"
+        "SET|age|21\n"
+        "SET|city|Bengaluru\n";
+    ASSERT_EQ(content, expected);
+}
+
+// ---------------------------------------------------------------------------
+// S3-4. DEL appends a correctly formatted record: "DEL|key\n"
+// ---------------------------------------------------------------------------
+TEST(s3_del_record_format) {
+    TEMP_WAL(guard);
+
+    {
+        forgekv::WAL wal(guard.path);
+        wal.append_del("age");
+    }
+
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content, "DEL|age\n");
+}
+
+// ---------------------------------------------------------------------------
+// S3-5. CLEAR appends exactly "CLEAR\n"
+// ---------------------------------------------------------------------------
+TEST(s3_clear_record_format) {
+    TEMP_WAL(guard);
+
+    {
+        forgekv::WAL wal(guard.path);
+        wal.append_clear();
+    }
+
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content, "CLEAR\n");
+}
+
+// ---------------------------------------------------------------------------
+// S3-6. Reopening WAL appends to existing content (does not truncate).
+// ---------------------------------------------------------------------------
+TEST(s3_reopen_preserves_content) {
+    TEMP_WAL(guard);
+
+    // First session: write a SET
+    {
+        forgekv::WAL wal(guard.path);
+        wal.append_set("key1", "val1");
+    }
+
+    // Second session: open the same file and write another record
+    {
+        forgekv::WAL wal(guard.path);
+        wal.append_set("key2", "val2");
+    }
+
+    const std::string content = read_file(guard.path);
+    const std::string expected =
+        "SET|key1|val1\n"
+        "SET|key2|val2\n";
+    ASSERT_EQ(content, expected);
+}
+
+// ---------------------------------------------------------------------------
+// S3-7. A mixed sequence produces the correct WAL.
+// ---------------------------------------------------------------------------
+TEST(s3_mixed_sequence) {
+    TEMP_WAL(guard);
+
+    {
+        forgekv::WAL wal(guard.path);
+        wal.append_set("name", "Vishnu");
+        wal.append_set("age",  "21");
+        wal.append_del("age");
+        wal.append_clear();
+    }
+
+    const std::string content = read_file(guard.path);
+    const std::string expected =
+        "SET|name|Vishnu\n"
+        "SET|age|21\n"
+        "DEL|age\n"
+        "CLEAR\n";
+    ASSERT_EQ(content, expected);
+}
+
+// ---------------------------------------------------------------------------
+// S3-8. WAL opening failure throws std::runtime_error.
+//        Use a path that cannot be created (directory as filename).
+// ---------------------------------------------------------------------------
+TEST(s3_wal_open_failure_throws) {
+    // A path containing a null byte is invalid on POSIX and Windows.
+    // An alternative: use a nonexistent deeply nested path.
+    // The most portable: try to open a directory as a file.
+    // We create a temp directory and then try to open it as a WAL file.
+    const std::string bad_path = "/tmp/forgekv_no_such_dir_xyz/wal.log";
+    ASSERT_THROWS(forgekv::WAL{bad_path});
+}
+
+// ---------------------------------------------------------------------------
+// S3-9. KeyValueStore::set() writes the WAL record and updates storage.
+// ---------------------------------------------------------------------------
+TEST(s3_kvstore_set_writes_wal_and_updates_storage) {
+    TEMP_WAL(guard);
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto* raw    = storage.get();   // retain raw ptr to inspect later
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+    store.set("name", "Vishnu");
+
+    // WAL should have the record
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content, "SET|name|Vishnu\n");
+
+    // In-memory storage should have the value
+    auto val = raw->get("name");
+    ASSERT_HAS_VALUE(val);
+    ASSERT_EQ(*val, "Vishnu");
+}
+
+// ---------------------------------------------------------------------------
+// S3-10. KeyValueStore::del() writes the WAL record and removes from storage.
+// ---------------------------------------------------------------------------
+TEST(s3_kvstore_del_writes_wal_and_updates_storage) {
+    TEMP_WAL(guard);
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto* raw    = storage.get();
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+    store.set("city", "Bengaluru");   // also writes SET|city|Bengaluru to WAL
+
+    bool removed = store.del("city");
+    ASSERT_TRUE(removed);
+
+    // WAL should contain both the SET and the DEL
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content,
+              "SET|city|Bengaluru\n"
+              "DEL|city\n");
+
+    // In-memory storage should no longer have the key
+    ASSERT_FALSE(raw->exists("city"));
+}
+
+// ---------------------------------------------------------------------------
+// S3-11. KeyValueStore::del() on a non-existent key does NOT write to WAL.
+// ---------------------------------------------------------------------------
+TEST(s3_del_missing_key_no_wal_record) {
+    TEMP_WAL(guard);
+
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(
+        std::make_unique<forgekv::InMemoryStorage>(),
+        std::move(wal)
+    );
+
+    bool removed = store.del("ghost");  // key never existed
+    ASSERT_FALSE(removed);
+
+    // WAL file should be empty — no record for a no-op del
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content, "");
+}
+
+// ---------------------------------------------------------------------------
+// S3-12. KeyValueStore::clear() writes CLEAR to WAL and empties storage.
+// ---------------------------------------------------------------------------
+TEST(s3_kvstore_clear_writes_wal) {
+    TEMP_WAL(guard);
+
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(
+        std::make_unique<forgekv::InMemoryStorage>(),
+        std::move(wal)
+    );
+
+    store.set("a", "1");
+    store.set("b", "2");
+    store.clear();
+
+    ASSERT_TRUE(store.empty());
+
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content,
+              "SET|a|1\n"
+              "SET|b|2\n"
+              "CLEAR\n");
+}
+
+// ---------------------------------------------------------------------------
+// S3-13. Read-only operations (get, exists, size, empty) do NOT write WAL.
+// ---------------------------------------------------------------------------
+TEST(s3_readonly_ops_no_wal_write) {
+    TEMP_WAL(guard);
+
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(
+        std::make_unique<forgekv::InMemoryStorage>(),
+        std::move(wal)
+    );
+
+    // Perform only read operations (cast to void to silence nodiscard warnings)
+    (void)store.get("absent");
+    (void)store.exists("absent");
+    (void)store.size();
+    (void)store.empty();
+
+    // WAL file must be empty
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content, "");
+}
+
+// ---------------------------------------------------------------------------
+// S3-14. Full DI: Storage and WAL are both injected.
+//        Verify the store works end-to-end with injected dependencies.
+// ---------------------------------------------------------------------------
+TEST(s3_full_di_storage_and_wal) {
+    TEMP_WAL(guard);
+
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(
+        std::make_unique<forgekv::InMemoryStorage>(),
+        std::move(wal)
+    );
+
+    store.set("project", "ForgeKV");
+    store.set("stage",   "3");
+    store.del("stage");
+
+    ASSERT_EQ(*store.get("project"), "ForgeKV");
+    ASSERT_FALSE(store.exists("stage"));
+
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content,
+              "SET|project|ForgeKV\n"
+              "SET|stage|3\n"
+              "DEL|stage\n");
+}
+
+// ---------------------------------------------------------------------------
+// S3-15. WAL path() accessor returns the configured path.
+// ---------------------------------------------------------------------------
+TEST(s3_wal_path_accessor) {
+    TEMP_WAL(guard);
+
+    forgekv::WAL wal(guard.path);
+    ASSERT_EQ(wal.path(), guard.path);
+}
+
+// ---------------------------------------------------------------------------
+// S3-16. Empty value in SET is written correctly: "SET|key|\n"
+// ---------------------------------------------------------------------------
+TEST(s3_set_empty_value) {
+    TEMP_WAL(guard);
+
+    forgekv::WAL wal(guard.path);
+    wal.append_set("emptyval", "");
+
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content, "SET|emptyval|\n");
+}
+
+// ---------------------------------------------------------------------------
+// S3-17. Empty key in SET is written correctly: "SET||value\n"
+// ---------------------------------------------------------------------------
+TEST(s3_set_empty_key) {
+    TEMP_WAL(guard);
+
+    forgekv::WAL wal(guard.path);
+    wal.append_set("", "somevalue");
+
+    const std::string content = read_file(guard.path);
+    ASSERT_EQ(content, "SET||somevalue\n");
+}
+
+// ---------------------------------------------------------------------------
+// S3-18. Stage 1 API still works when WAL is injected (end-to-end).
+//        Verifies backward compatibility across all seven Stage 1 operations.
+// ---------------------------------------------------------------------------
+TEST(s3_stage1_api_works_with_wal) {
+    TEMP_WAL(guard);
+
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(
+        std::make_unique<forgekv::InMemoryStorage>(),
+        std::move(wal)
+    );
+
+    // set / get
+    store.set("lang", "C++");
+    ASSERT_EQ(*store.get("lang"), "C++");
+
+    // exists
+    ASSERT_TRUE(store.exists("lang"));
+
+    // size / empty
+    ASSERT_EQ(store.size(), std::size_t{1});
+    ASSERT_FALSE(store.empty());
+
+    // del (existing)
+    ASSERT_TRUE(store.del("lang"));
+    ASSERT_FALSE(store.exists("lang"));
+    ASSERT_TRUE(store.empty());
+
+    // del (missing)
+    ASSERT_FALSE(store.del("lang"));
+
+    // set + clear
+    store.set("x", "1");
+    store.clear();
+    ASSERT_TRUE(store.empty());
+}
+
+// =============================================================================
 // Test runner
 // =============================================================================
 
@@ -595,8 +1029,8 @@ int main() {
     int passed = 0;
     int failed = 0;
 
-    std::cout << "\nForgeKV Stage 1 — KeyValueStore Tests\n";
-    std::cout << std::string(45, '=') << "\n\n";
+    std::cout << "\nForgeKV Stage 1 + 2 + 3 — KeyValueStore & WAL Tests\n";
+    std::cout << std::string(55, '=') << "\n\n";
 
     for (const auto& tc : tests) {
         std::cout << "  [ RUN  ] " << tc.name << "\n";
@@ -618,7 +1052,7 @@ int main() {
         }
     }
 
-    std::cout << "\n" << std::string(45, '=') << "\n";
+    std::cout << "\n" << std::string(55, '=') << "\n";
     std::cout << "Results: " << passed << " passed, " << failed << " failed"
               << " (total: " << (passed + failed) << ")\n\n";
 

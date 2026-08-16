@@ -1,30 +1,48 @@
-# 03 — Write-Ahead Log
+# 03 — Write-Ahead Log (Text WAL)
 
-> **Stage:** 3 (text WAL) and 4 (binary WAL)  
-> **Status:** 🔲 Planned. This document describes the design before implementation begins.
+> **Stage:** 3 — Text Write-Ahead Log  
+> **Status:** ✅ Complete. Implemented and tested.  
+> **Version:** v0.3.0
+
+---
+
+## Table of Contents
+
+1. [The Problem: RAM is Volatile](#the-problem-ram-is-volatile)
+2. [The Solution: Write-Ahead Log](#the-solution-write-ahead-log)
+3. [Architecture](#architecture)
+4. [Write Ordering](#write-ordering)
+5. [WAL Record Format](#wal-record-format)
+6. [Example WAL Contents](#example-wal-contents)
+7. [Operations and WAL Behavior](#operations-and-wal-behavior)
+8. [File Handling](#file-handling)
+9. [Error Handling](#error-handling)
+10. [Format Constraints (Stage 3 Limitations)](#format-constraints-stage-3-limitations)
+11. [What Stage 3 Does NOT Implement](#what-stage-3-does-not-implement)
+12. [New Files](#new-files)
+13. [Modified Files](#modified-files)
 
 ---
 
 ## The Problem: RAM is Volatile
 
-After Stage 1, ForgeKV's entire state lives in `std::unordered_map`. That map lives in RAM. RAM is volatile: the moment the process exits, crashes, or the machine loses power, every key-value pair is gone forever.
+After Stage 2, ForgeKV's entire state lives in `InMemoryStorage`, which wraps a `std::unordered_map` in RAM. RAM is volatile: when the process exits, crashes, or the machine loses power, every key-value pair is gone.
 
 ```
 Without persistence:
 
   store.set("account_balance", "10000");
-  // ... process crash or SIGKILL ...
-  // On restart: the store is empty.
-  // The value is gone.
+  // process crash or SIGKILL
+  // on restart: the store is empty — data lost
 ```
 
-For a storage engine, this is the fundamental unsolved problem. Data must outlive the process that holds it.
+For a storage engine, this is the fundamental unsolved problem. Data must outlive the process that created it.
 
 ---
 
-## The Solution: Write-Ahead Log (WAL)
+## The Solution: Write-Ahead Log
 
-A **Write-Ahead Log** is an append-only file on disk. Every time the store is mutated — every SET and every DELETE — a record of that mutation is written to the WAL **before** the in-memory state is updated.
+A **Write-Ahead Log** is an append-only file on disk. Every time the store is mutated — every SET, every DEL, every CLEAR — a record of that mutation is written to the WAL file **before** the in-memory state is updated.
 
 "Write-ahead" means: the log entry is written first. The in-memory state is updated second. Never the reverse.
 
@@ -34,149 +52,304 @@ Mutation request arrives
         ▼
   Write record to WAL file on disk
         │
-        ▼ (only after the write succeeds)
-  Update in-memory state
+        ▼  (only after WAL write succeeds)
+  Update in-memory state (Storage)
         │
         ▼
   Return success to caller
 ```
 
-If the process crashes between the WAL write and the memory update, the WAL still contains the record. On the next startup, the record is replayed and the memory is updated then.
+If the WAL write fails for any reason, the in-memory state is **not** modified. The exception propagates to the caller, who can observe that the operation failed.
 
-If the process crashes before the WAL write completes (a partial write), the partial record is detected and discarded. No half-applied mutation enters the store.
-
----
-
-## Why Append-Only?
-
-The WAL is opened in append mode: new records are always added at the end. The file is never rewritten in place.
-
-This is deliberate:
-
-- **Append is the safest write.** An appended record either fully lands on disk or it does not. Overwriting an existing record can corrupt the old data before the new data is safely written.
-- **Sequential writes are fast.** Hard drives and SSDs handle sequential appends better than random writes.
-- **Simple recovery.** To reconstruct state, read the file from the beginning and apply records in order. No page management, no B-tree walking.
-
-The tradeoff is that the WAL grows without bound unless compacted. That is addressed in Stage 8.
+This invariant ensures the WAL and in-memory state are never out of sync due to a partial failure.
 
 ---
 
-## Stage 3 — Text WAL
+## Architecture
 
-The first WAL implementation uses a simple human-readable text format. Each line represents one operation.
-
-Example of what a text WAL might look like:
+Stage 3 preserves the Stage 2 storage abstraction and adds a WAL alongside it:
 
 ```
-SET name Vishnu
-SET age 21
-SET city Bengaluru
-DELETE age
-SET name Vishnu Kumar
+                  KeyValueStore
+                 /             \
+                /               \
+               v                 v
+           Storage             WAL
+               |                 |
+               v                 v
+       InMemoryStorage      forgekv.wal (text)
+               |
+               v
+         unordered_map
 ```
 
-### Advantages of text WAL
+The WAL is a separate component with its own responsibility: writing records to disk. It does not know about in-memory state, keys, or recovery. `KeyValueStore` coordinates both.
 
-- Easy to inspect with a text editor or `cat`
-- Easy to implement and debug
-- Helpful during development to verify correctness
+The WAL lives in:
 
-### Disadvantages of text WAL
+- `include/forgekv/wal.h` — class declaration and documentation
+- `src/wal.cpp` — implementation
 
-- No fixed structure — parsing requires careful handling of edge cases
-- No integrity checking — a truncated or corrupted file is hard to detect reliably
-- Inefficient for large keys or values
-
-Text WAL is an intermediate step. It is replaced in Stage 4.
+`KeyValueStore` owns a `std::unique_ptr<WAL>` alongside `std::unique_ptr<Storage>`. Both are injected at construction time or created with sensible defaults.
 
 ---
 
-## Stage 4 — Binary WAL
+## Write Ordering
 
-Stage 4 replaces the text format with a structured binary format.
+The write-ordering invariant for each mutating operation:
 
-### Why Binary?
-
-A binary format allows:
-
-1. **Fixed-width fields.** Record lengths are encoded numerically, not derived from parsing. This makes reading faster and more reliable.
-2. **Checksums.** A checksum (e.g., CRC32) is computed over the record content and stored in the header. On replay, recomputing the checksum detects corruption.
-3. **Compact storage.** Binary is smaller than text for the same data, especially for numeric values.
-4. **Partial write detection.** If a record's stated length does not match available data, or if its checksum fails, it is discarded. A text format makes this harder to detect reliably.
-
-### Conceptual Binary Record Structure
-
-The exact binary format will be finalized during Stage 4 implementation. Conceptually, each record will include:
+### SET
 
 ```
-┌────────────────────────────────────────────┐
-│  Opcode       (1 byte)                     │  ← SET=1, DELETE=2
-│  Key length   (4 bytes, uint32_t)          │
-│  Value length (4 bytes, uint32_t)          │  ← 0 for DELETE
-│  Checksum     (4 bytes, CRC32)             │  ← over key + value
-│  Key          (variable, key_length bytes) │
-│  Value        (variable, val_length bytes) │  ← absent for DELETE
-└────────────────────────────────────────────┘
+KeyValueStore::set(key, value)
+        │
+        ▼
+  wal_->append_set(key, value)   ← WAL write FIRST
+        │
+        ▼  (only if WAL write succeeds)
+  storage_->set(key, value)      ← in-memory update SECOND
 ```
 
-This is a design sketch. Fields and their sizes may be adjusted during implementation to suit alignment, portability, or practical needs.
+### DEL
 
-### Opcodes
+```
+KeyValueStore::del(key)
+        │
+        ├─── storage_->exists(key) returns false
+        │         │
+        │         └──→ return false immediately (no WAL write, no storage change)
+        │
+        └─── storage_->exists(key) returns true
+                  │
+                  ▼
+          wal_->append_del(key)   ← WAL write FIRST
+                  │
+                  ▼
+          storage_->del(key)      ← in-memory removal SECOND
+                  │
+                  ▼
+          return true
+```
 
-| Opcode | Operation | Meaning                         |
-|--------|-----------|----------------------------------|
-| 1      | SET       | Insert or update key with value  |
-| 2      | DELETE    | Remove key from store            |
+### CLEAR
 
-GET and EXISTS are read operations. They do not modify state and are never written to the WAL.
+```
+KeyValueStore::clear()
+        │
+        ▼
+  wal_->append_clear()    ← WAL write FIRST
+        │
+        ▼
+  storage_->clear()       ← in-memory wipe SECOND
+```
 
 ---
 
-## Write Path (With WAL)
+## WAL Record Format
+
+Each record occupies exactly one line. The format is:
+
+| Operation | Record format          | Example                    |
+|-----------|------------------------|----------------------------|
+| SET       | `SET\|<key>\|<value>`  | `SET\|name\|Vishnu`        |
+| DEL       | `DEL\|<key>`           | `DEL\|age`                 |
+| CLEAR     | `CLEAR`                | `CLEAR`                    |
+
+- The field delimiter is `|` (pipe character).
+- Each record is terminated by a `\n` (Unix newline).
+- Records are appended sequentially; the file is never rewritten.
+
+### Why `|` as delimiter?
+
+`|` is uncommon in typical keys and values, making it easy to parse. The format is human-readable and inspectable with any text editor or `cat`.
+
+### Read operations are NOT logged
+
+`get()`, `exists()`, `size()`, and `empty()` are pure reads. They do not modify state, so they produce no WAL records.
+
+---
+
+## Example WAL Contents
+
+After this sequence of operations:
+
+```cpp
+store.set("name", "Vishnu");
+store.set("age",  "21");
+store.set("city", "Bengaluru");
+store.del("age");
+store.set("name", "Vishnu Kumar");
+store.clear();
+store.set("project", "ForgeKV");
+store.set("stage",   "3");
+```
+
+The WAL file (`forgekv.wal`) contains:
 
 ```
-Client calls: SET "name" "Vishnu"
-                    │
-                    ▼
-         Serialize the operation
-         into a WAL record
-                    │
-                    ▼
-         Open WAL file (append mode)
-                    │
-                    ▼
-         Write and flush record to disk
-         (fsync ensures disk write, not just OS buffer)
-                    │
-                    ▼
-         Update in-memory store:
-         store["name"] = "Vishnu"
-                    │
-                    ▼
-         Return success
+SET|name|Vishnu
+SET|age|21
+SET|city|Bengaluru
+DEL|age
+SET|name|Vishnu Kumar
+CLEAR
+SET|project|ForgeKV
+SET|stage|3
 ```
 
-The flush/fsync step is important: without it, the OS may buffer the write in memory, and a crash before the buffer is flushed means the record is lost. `fsync` forces the write to physical storage.
+This file is plain text. You can inspect it at any time:
+
+```bash
+cat build/forgekv.wal
+```
 
 ---
 
-## What the WAL Does Not Do
+## Operations and WAL Behavior
 
-The WAL alone does not:
+| Operation  | WAL record written? | Condition                              |
+|------------|--------------------|-----------------------------------------|
+| `set(k,v)` | Yes — `SET\|k\|v`  | Always                                  |
+| `del(k)`   | Yes — `DEL\|k`     | Only when key exists in storage         |
+| `del(k)`   | No                 | When key does not exist (no-op)         |
+| `clear()`  | Yes — `CLEAR`      | Always                                  |
+| `get(k)`   | No                 | Read-only, no state change              |
+| `exists(k)`| No                 | Read-only, no state change              |
+| `size()`   | No                 | Read-only, no state change              |
+| `empty()`  | No                 | Read-only, no state change              |
 
-- Reconstruct state on startup — that is Stage 5 (Crash Recovery)
-- Limit its own growth — that is Stage 8 (Compaction)
-- Work safely with multiple concurrent writers — that is Stage 7 (Concurrency)
+### Why only log DEL when the key exists?
 
-The WAL is a write-only append mechanism. Recovery, compaction, and concurrency are separate concerns.
+A DEL on a non-existent key changes nothing. The WAL should be a log of state changes, not of attempted operations. Logging a no-op DEL would create spurious records that a future recovery stage would have to handle or ignore. Keeping only meaningful records makes the WAL semantically clean.
+
+### Why CLEAR gets its own record?
+
+`CLEAR` removes all keys at once. Individual DEL records would be impractical for large stores. A single `CLEAR` record is unambiguous and efficient.
 
 ---
 
-## WAL File Location
+## File Handling
 
-The WAL will be stored at a configurable path, defaulting to the current working directory or a configurable data directory. The file name will be something like `forgekv.wal`. The exact naming and location will be finalized at implementation time.
+- The WAL file is opened with `std::ofstream` in **append mode** (`std::ios::app`).
+- If the file does not exist, it is created on first open.
+- If the file already exists, new records are appended — existing content is never truncated or overwritten.
+- Each record is flushed immediately after writing (`stream_.flush()`), so the OS buffer is drained after every operation.
+- The file is closed automatically when the `WAL` object is destroyed (RAII via `std::ofstream`).
+
+### Default WAL path
+
+When `KeyValueStore` is constructed with its default constructor, the WAL is opened at:
+
+```
+forgekv.wal
+```
+
+(relative to the current working directory). When running tests via `ctest`, this resolves to the `build/` directory, which is gitignored — the source tree is never polluted.
+
+### Configuring the WAL path
+
+Pass a `std::unique_ptr<WAL>` to the full dependency-injection constructor:
+
+```cpp
+auto wal = std::make_unique<forgekv::WAL>("/data/myapp.wal");
+auto store = forgekv::KeyValueStore(
+    std::make_unique<forgekv::InMemoryStorage>(),
+    std::move(wal)
+);
+```
 
 ---
 
-*Previous: [02-in-memory-store.md](02-in-memory-store.md)*  
+## Error Handling
+
+### WAL construction failure
+
+If the log file cannot be opened (bad path, permissions, missing directory), the `WAL` constructor throws `std::runtime_error`:
+
+```cpp
+// Throws std::runtime_error — the caller must handle it
+forgekv::WAL wal("/nonexistent/path/forgekv.wal");
+```
+
+This means constructing a `KeyValueStore` with a bad WAL path also throws. The store is never left in a usable state with a broken WAL.
+
+### WAL write failure
+
+If a write fails (disk full, file descriptor closed, I/O error), `append_set`, `append_del`, or `append_clear` throws `std::runtime_error`.
+
+Because the WAL write happens **before** the in-memory mutation, a write failure leaves in-memory state unchanged. The store remains consistent: the operation failed atomically from the caller's perspective.
+
+```cpp
+// If this throws, storage is unchanged — the key was not set
+store.set("key", "value");
+```
+
+### Error propagation
+
+Errors are propagated as C++ exceptions (`std::runtime_error`). `std::cout` is not used for error reporting. Callers can catch and handle the exception, or let it propagate up the call stack.
+
+---
+
+## Format Constraints (Stage 3 Limitations)
+
+Stage 3's text format has one significant constraint:
+
+**Keys and values must not contain:**
+- `|` — the field delimiter
+- `\n` — the record terminator  
+- `\r` — carriage return (would corrupt line parsing)
+
+These constraints are **documented but not enforced at runtime** in Stage 3. If a key or value contains a `|`, the resulting WAL record will be malformed and will not parse correctly in a future recovery stage.
+
+Stage 4 (Binary WAL) eliminates these constraints by using length-prefixed binary fields, which require no special escaping and support arbitrary byte sequences in keys and values.
+
+For Stage 3, the practical implication is simple: use normal string keys and values. Keys like `"user:name"`, `"page:count"`, `"server-1"` are all fine. Keys containing `|` are not.
+
+---
+
+## What Stage 3 Does NOT Implement
+
+Stage 3 provides **WAL writing only**. The following are explicitly out of scope:
+
+| Feature                    | Stage |
+|----------------------------|-------|
+| Crash recovery / WAL replay | 5     |
+| Binary WAL + checksums      | 4     |
+| WAL compaction              | 8     |
+| Thread-safe WAL writes      | 7     |
+| Snapshots                   | 9     |
+| HTTP server                 | 6     |
+| TTL / key expiration        | 10    |
+| Statistics                  | 11    |
+| Benchmarking                | 12    |
+
+**ForgeKV is NOT crash-recoverable after Stage 3.**
+
+The WAL file is written to disk on every mutation, but on restart, the WAL is not read or replayed. The in-memory store starts empty. Stage 5 will add the recovery logic that reads the WAL on startup and reconstructs the in-memory state.
+
+After Stage 5, the WAL file will enable crash recovery. After Stage 3, it is a log you can inspect but not yet replay automatically.
+
+---
+
+## New Files
+
+| File                        | Description                                 |
+|-----------------------------|---------------------------------------------|
+| `include/forgekv/wal.h`     | WAL class declaration and documentation     |
+| `src/wal.cpp`               | WAL implementation                          |
+
+---
+
+## Modified Files
+
+| File                        | Change                                                    |
+|-----------------------------|-----------------------------------------------------------|
+| `include/forgekv/kv_store.h`| Added WAL dependency; added full DI constructor           |
+| `src/kv_store.cpp`          | Implemented write-ahead ordering in set/del/clear         |
+| `tests/test_kv_store.cpp`   | Added 18 Stage 3 WAL tests; updated S2-19 for new del() semantics |
+| `CMakeLists.txt`            | Added `src/wal.cpp`; bumped version to 0.3.0              |
+
+---
+
+*Previous: [02-storage-abstraction.md](02-storage-abstraction.md)*  
 *Next: [04-crash-recovery.md](04-crash-recovery.md)*
