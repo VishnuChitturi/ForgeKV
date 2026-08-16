@@ -1,10 +1,11 @@
 // =============================================================================
-// ForgeKV — Stage 3: KeyValueStore implementation (WAL integration)
+// ForgeKV — Stage 4: KeyValueStore implementation (Binary WAL + Checksums)
 // =============================================================================
 //
 // Every mutating operation follows the write-ahead ordering:
 //
 //   1. Write the record to the WAL (wal_->append_*).
+//      The WAL now writes a structured binary record with a CRC32 checksum.
 //   2. Only if the WAL write succeeds, apply the mutation to storage_.
 //
 // If the WAL write throws, the exception propagates to the caller and
@@ -17,6 +18,9 @@
 //   If the key is absent, del() returns false immediately without touching
 //   the WAL. This keeps the WAL semantically meaningful — every record in
 //   the log represents an operation that changed state.
+//
+// Stage 4 does NOT implement WAL replay or crash recovery.
+// That is Stage 5. Stage 4 only writes and validates the binary format.
 // =============================================================================
 
 #include "forgekv/kv_store.h"

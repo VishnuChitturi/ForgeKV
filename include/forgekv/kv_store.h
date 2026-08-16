@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// ForgeKV — Stage 3: KeyValueStore (WAL integration)
+// ForgeKV — Stage 4: KeyValueStore (Binary WAL + Checksums)
 // =============================================================================
 //
 // KeyValueStore is the public-facing engine of ForgeKV. It maps string keys to
@@ -12,6 +12,11 @@
 //          storage operations through the interface.
 // Stage 3: KeyValueStore also owns a std::unique_ptr<WAL>. Every mutating
 //          operation writes a WAL record BEFORE touching in-memory storage.
+//          The Stage 3 WAL used a human-readable text format.
+// Stage 4: The WAL now uses a structured binary format with CRC32 checksums.
+//          Keys and values are stored with explicit byte lengths, so any byte
+//          sequence (including '|', '\n', '\r', spaces) is handled correctly.
+//          The KeyValueStore API and write-ordering invariants are unchanged.
 //
 // Architecture:
 //
@@ -22,12 +27,12 @@
 //            Storage             WAL
 //                |                 |
 //                v                 v
-//        InMemoryStorage      forgekv.wal (text)
+//        InMemoryStorage      forgekv.wal (binary)
 //                |
 //                v
 //          unordered_map
 //
-// Write ordering (Stage 3 invariant):
+// Write ordering (Stage 4 invariant — unchanged from Stage 3):
 //
 //   KeyValueStore::set()   → WAL::append_set()   → Storage::set()
 //   KeyValueStore::del()   → WAL::append_del()   → Storage::del()
@@ -46,7 +51,7 @@
 // Full dependency-injection constructor:
 //   KeyValueStore store(std::move(storage), std::move(wal));
 //   → accepts any Storage and any WAL.
-//   → used in Stage 3 tests with a test-specific WAL path.
+//   → used in Stage 4 tests with a test-specific WAL path.
 //
 // Ownership model:
 //   KeyValueStore owns both storage_ and wal_ exclusively via unique_ptr.

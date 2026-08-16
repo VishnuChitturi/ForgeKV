@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     ForgeKV
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "A persistent, concurrent key-value storage engine built from scratch in C++20"
     LANGUAGES CXX
 )
@@ -33,7 +33,7 @@ message(STATUS "Compiler         : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER
 add_library(forgekv_core STATIC
     src/kv_store.cpp
     src/in_memory_storage.cpp   # Stage 2: InMemoryStorage implementation
-    src/wal.cpp                 # Stage 3: Write-Ahead Log implementation
+    src/wal.cpp                 # Stage 4: Binary WAL + CRC32 checksums
 )
 
 # PUBLIC: anything that links forgekv_core also gets this include path.
@@ -48,7 +48,7 @@ target_compile_options(forgekv_core PRIVATE
 )
 
 # ---------------------------------------------------------------------------
-# forgekv_tests — test binary (Stage 1 + Stage 2 + Stage 3)
+# forgekv_tests — test binary (Stage 1 + Stage 2 + Stage 3 + Stage 4)
 # ---------------------------------------------------------------------------
 
 add_executable(forgekv_tests
