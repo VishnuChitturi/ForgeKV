@@ -1,7 +1,6 @@
 #pragma once
-
 // =============================================================================
-// ForgeKV — Stage 4: KeyValueStore (Binary WAL + Checksums)
+// ForgeKV — Stage 5: KeyValueStore (Crash Recovery / WAL Replay)
 // =============================================================================
 //
 // KeyValueStore is the public-facing engine of ForgeKV. It maps string keys to
@@ -17,49 +16,60 @@
 //          Keys and values are stored with explicit byte lengths, so any byte
 //          sequence (including '|', '\n', '\r', spaces) is handled correctly.
 //          The KeyValueStore API and write-ordering invariants are unchanged.
+// Stage 5: On construction, KeyValueStore replays the existing WAL into
+//          Storage, reconstructing the key-value state from before the last
+//          shutdown.  All three constructors perform recovery automatically.
+//          Recovery does NOT write new WAL records.  After recovery, normal
+//          mutations continue appending to the existing WAL.
 //
-// Architecture:
+// Architecture (Stage 5):
 //
 //                   KeyValueStore
-//                  /             \
-//                 /               \
-//                v                 v
-//            Storage             WAL
-//                |                 |
-//                v                 v
-//        InMemoryStorage      forgekv.wal (binary)
-//                |
-//                v
-//          unordered_map
+//                  /     |       \
+//                 /      |        \
+//                v       v         v
+//            Storage  Recovery    WAL
+//                |       |         |
+//                v       v         v
+//        InMemoryStorage  ←  forgekv.wal (binary)
 //
-// Write ordering (Stage 4 invariant — unchanged from Stage 3):
+// Startup sequence:
+//
+//   1. Construct Storage (empty).
+//   2. Open WAL (append mode — existing content preserved).
+//   3. Recovery::run() replays WAL records into Storage.
+//   4. Store is ready for normal operation.
+//
+// Write ordering (unchanged from Stage 4):
 //
 //   KeyValueStore::set()   → WAL::append_set()   → Storage::set()
 //   KeyValueStore::del()   → WAL::append_del()   → Storage::del()
 //   KeyValueStore::clear() → WAL::append_clear() → Storage::clear()
 //
-//   If a WAL write throws, the in-memory state is NOT changed.
-//   The exception propagates to the caller.
+// Recovery ordering (does NOT write to WAL):
 //
-// Read operations (get, exists, size, empty) do NOT write to the WAL.
+//   WAL::replay() → Recovery::run() → Storage::set/del/clear()
 //
-// Default construction:
-//   KeyValueStore store;
-//   → creates InMemoryStorage and opens WAL at "forgekv.wal".
-//   → existing Stage 1 and Stage 2 code needs no changes.
+// Recovery failure:
 //
-// Full dependency-injection constructor:
-//   KeyValueStore store(std::move(storage), std::move(wal));
-//   → accepts any Storage and any WAL.
-//   → used in Stage 4 tests with a test-specific WAL path.
+//   If the WAL contains a corrupted complete record (bad magic, version,
+//   opcode, or checksum mismatch), or a truncated record that is NOT the
+//   final entry, the constructor throws std::runtime_error.  The store
+//   must not be used after a constructor throw.
 //
-// Ownership model:
-//   KeyValueStore owns both storage_ and wal_ exclusively via unique_ptr.
-//   It is not copyable. Move is allowed.
+//   A truncated FINAL record (common after a crash mid-write) is treated
+//   as non-fatal: all prior complete records are replayed and the store
+//   starts normally.
+//
+// New WAL file / empty WAL:
+//
+//   If the WAL file does not exist or is empty, recovery is a no-op.
+//   The store starts with an empty Storage, as before Stage 5.
 //
 // Thread safety: NOT thread-safe at this stage. Stage 7 adds synchronization.
 // =============================================================================
 
+#include "forgekv/recovery.h"
 #include "forgekv/storage.h"
 #include "forgekv/wal.h"
 
@@ -76,20 +86,22 @@ public:
     // -------------------------------------------------------------------------
 
     // Default constructor — creates InMemoryStorage and opens WAL at
-    // "forgekv.wal" in the current working directory.
-    // Throws std::runtime_error if the WAL file cannot be opened.
+    // "forgekv.wal" in the current working directory.  Performs WAL replay
+    // into Storage before the store is ready for use.
+    // Throws std::runtime_error if the WAL file cannot be opened or if
+    // recovery encounters unrecoverable corruption.
     KeyValueStore();
 
     // Full dependency-injection constructor — accepts any Storage and WAL.
-    // Takes ownership of both pointers.
+    // Takes ownership of both pointers.  Performs WAL replay into Storage.
     // Throws std::invalid_argument if storage or wal is null.
+    // Throws std::runtime_error if recovery fails.
     explicit KeyValueStore(std::unique_ptr<Storage> storage,
                            std::unique_ptr<WAL>     wal);
 
     // Storage-only injection (convenience overload) — creates a default WAL
     // at "forgekv.wal". Kept for backward compatibility with Stage 2 tests
-    // that inject only a Storage. The WAL is still opened and will be written
-    // to on every mutation.
+    // that inject only a Storage.  Performs WAL replay into Storage.
     explicit KeyValueStore(std::unique_ptr<Storage> storage);
 
     ~KeyValueStore() = default;
@@ -135,6 +147,25 @@ public:
     void clear();
 
 private:
+    // -------------------------------------------------------------------------
+    // Recovery helper
+    // -------------------------------------------------------------------------
+
+    // Replay the WAL into storage_.  Called once from each constructor after
+    // both storage_ and wal_ are initialised.
+    //
+    // On success (clean WAL, empty WAL, or truncated-final-record):
+    //   returns normally.  storage_ contains the reconstructed state.
+    //
+    // On failure (corrupted record, mid-log truncation):
+    //   throws std::runtime_error.  The constructor propagates the exception
+    //   and the store must not be used.
+    void recover();
+
+    // -------------------------------------------------------------------------
+    // State
+    // -------------------------------------------------------------------------
+
     // Backing storage — owned exclusively. Never null after construction.
     std::unique_ptr<Storage> storage_;
 

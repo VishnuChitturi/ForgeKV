@@ -121,10 +121,57 @@ struct AssertionFailure {
 // =============================================================================
 // Stage 1 Tests
 // =============================================================================
+//
+// Note (Stage 5 update): All Stage 1 tests now use explicit temporary WAL paths
+// to avoid reading any pre-existing forgekv.wal in the working directory.
+// Stage 5 changed the KeyValueStore constructors to perform WAL recovery, so
+// using the default WAL path could produce a non-empty store if a leftover
+// WAL exists from a previous run.  Using a temp WAL ensures each test starts
+// with a clean, empty store.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// File/temp helpers — used by Stage 1–5 tests
+// These are declared here (before any tests) so all stages can use them.
+// ---------------------------------------------------------------------------
+
+// Helper: read the entire content of a file into a vector of bytes.
+static std::vector<std::uint8_t> read_file_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        throw std::runtime_error("read_file_bytes: cannot open: " + path);
+    }
+    return std::vector<std::uint8_t>(
+        std::istreambuf_iterator<char>(f),
+        std::istreambuf_iterator<char>());
+}
+
+// Helper: RAII guard that deletes a file on scope exit.
+struct TempFile {
+    std::string path;
+    explicit TempFile(std::string p) : path(std::move(p)) {}
+    ~TempFile() {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+};
+
+// Unique temp WAL path per test.
+#define TEMP_WAL(name) \
+    TempFile name{"test_wal_" #name ".wal"}
+
+// Helper macro: declare a temp WAL, open a DI store with it, and wire them.
+#define KV_WITH_TEMP_WAL(store_name)                                    \
+    TempFile store_name##_wal{"test_s1_" #store_name ".wal"};           \
+    auto store_name##_storage = std::make_unique<forgekv::InMemoryStorage>(); \
+    auto store_name##_wal_ptr = std::make_unique<forgekv::WAL>(store_name##_wal.path); \
+    forgekv::KeyValueStore store_name(                                   \
+        std::move(store_name##_storage),                                 \
+        std::move(store_name##_wal_ptr))
 
 // 1. SET followed by GET — fundamental round-trip
 TEST(set_then_get) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("name", "Vishnu");
     auto result = store.get("name");
     ASSERT_HAS_VALUE(result);
@@ -133,7 +180,7 @@ TEST(set_then_get) {
 
 // 2. Multiple keys — independent entries
 TEST(multiple_keys) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("name", "Vishnu");
     store.set("age", "21");
     store.set("city", "Bengaluru");
@@ -151,7 +198,7 @@ TEST(multiple_keys) {
 
 // 3. Updating an existing key — value is overwritten, key count stays the same
 TEST(update_existing_key) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("name", "Alice");
     ASSERT_EQ(*store.get("name"), "Alice");
     store.set("name", "Bob");
@@ -161,14 +208,14 @@ TEST(update_existing_key) {
 
 // 4. GET of a missing key — must return nullopt, not crash or return garbage
 TEST(get_missing_key) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     auto result = store.get("nonexistent");
     ASSERT_NO_VALUE(result);
 }
 
 // 5. GET returns nullopt after DELETE
 TEST(delete_existing_key) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("key", "value");
     ASSERT_HAS_VALUE(store.get("key"));
     bool removed = store.del("key");
@@ -179,7 +226,7 @@ TEST(delete_existing_key) {
 
 // 6. DELETE of a missing key — must be a safe no-op, not crash
 TEST(delete_missing_key) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     bool removed = store.del("ghost");
     ASSERT_FALSE(removed);
     ASSERT_EQ(store.size(), std::size_t{0});
@@ -187,20 +234,20 @@ TEST(delete_missing_key) {
 
 // 7. EXISTS for an existing key
 TEST(exists_present_key) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("lang", "C++");
     ASSERT_TRUE(store.exists("lang"));
 }
 
 // 8. EXISTS for a missing key
 TEST(exists_absent_key) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     ASSERT_FALSE(store.exists("missing"));
 }
 
 // 9a. Empty string as a value — valid input
 TEST(empty_string_value) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("key", "");
     auto result = store.get("key");
     ASSERT_HAS_VALUE(result);
@@ -209,7 +256,7 @@ TEST(empty_string_value) {
 
 // 9b. Empty string as a key — valid (unusual but should not crash)
 TEST(empty_string_key) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("", "empty-key-value");
     auto result = store.get("");
     ASSERT_HAS_VALUE(result);
@@ -221,7 +268,7 @@ TEST(empty_string_key) {
 
 // 10. Repeated set/del/exists operations in sequence
 TEST(repeated_operations) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     for (int i = 0; i < 100; ++i) {
         store.set("counter", std::to_string(i));
     }
@@ -234,7 +281,7 @@ TEST(repeated_operations) {
 
 // 11. size() and empty() semantics
 TEST(size_and_empty) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     ASSERT_TRUE(store.empty());
     ASSERT_EQ(store.size(), std::size_t{0});
     store.set("a", "1");
@@ -251,7 +298,7 @@ TEST(size_and_empty) {
 
 // 12. clear() removes all entries
 TEST(clear_store) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("x", "1");
     store.set("y", "2");
     store.set("z", "3");
@@ -265,7 +312,7 @@ TEST(clear_store) {
 
 // 13. EXISTS is not affected by GET (read-only check)
 TEST(exists_is_read_only) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("k", "v");
     ASSERT_TRUE(store.exists("k"));
     ASSERT_EQ(store.size(), std::size_t{1});
@@ -273,7 +320,7 @@ TEST(exists_is_read_only) {
 
 // 14. del() is idempotent — calling twice on same key is safe
 TEST(double_delete) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("temp", "data");
     ASSERT_TRUE(store.del("temp"));
     ASSERT_FALSE(store.del("temp"));
@@ -282,7 +329,7 @@ TEST(double_delete) {
 
 // 15. Large number of distinct keys
 TEST(many_keys) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     const int N = 1000;
     for (int i = 0; i < N; ++i) {
         store.set("key:" + std::to_string(i), "val:" + std::to_string(i));
@@ -448,10 +495,14 @@ TEST(storage_interface_size_empty_clear) {
 // =============================================================================
 // KeyValueStore through the abstraction — Stage 1 contracts still hold
 // =============================================================================
+//
+// Note (Stage 5 update): Tests that previously used the default KeyValueStore
+// constructor now use explicit temp WAL paths to start with a clean empty store.
+// =============================================================================
 
 // S2-12.
 TEST(kv_default_ctor_still_works) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("stage", "2");
     ASSERT_EQ(*store.get("stage"), "2");
     ASSERT_TRUE(store.exists("stage"));
@@ -463,7 +514,7 @@ TEST(kv_default_ctor_still_works) {
 
 // S2-13.
 TEST(kv_update_through_abstraction) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("k", "old");
     store.set("k", "new");
     ASSERT_EQ(*store.get("k"), "new");
@@ -472,7 +523,7 @@ TEST(kv_update_through_abstraction) {
 
 // S2-14.
 TEST(kv_clear_through_abstraction) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     store.set("x", "1");
     store.set("y", "2");
     store.clear();
@@ -482,14 +533,14 @@ TEST(kv_clear_through_abstraction) {
 
 // S2-15.
 TEST(kv_missing_key_through_abstraction) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     ASSERT_NO_VALUE(store.get("absent"));
     ASSERT_FALSE(store.exists("absent"));
 }
 
 // S2-16.
 TEST(kv_del_missing_through_abstraction) {
-    forgekv::KeyValueStore store;
+    KV_WITH_TEMP_WAL(store);
     ASSERT_FALSE(store.del("no-such-key"));
     ASSERT_EQ(store.size(), std::size_t{0});
 }
@@ -500,18 +551,22 @@ TEST(kv_del_missing_through_abstraction) {
 
 // S2-17.
 TEST(di_forwards_set) {
+    TEMP_WAL(guard);
     auto* fake = new FakeStorage();
     auto ptr = std::unique_ptr<forgekv::Storage>(fake);
-    forgekv::KeyValueStore store(std::move(ptr));
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(ptr), std::move(wal));
     store.set("k", "v");
     ASSERT_EQ(fake->set_calls, 1);
 }
 
 // S2-18.
 TEST(di_forwards_get) {
+    TEMP_WAL(guard);
     auto* fake = new FakeStorage();
     auto ptr = std::unique_ptr<forgekv::Storage>(fake);
-    forgekv::KeyValueStore store(std::move(ptr));
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(ptr), std::move(wal));
     auto result = store.get("k");
     ASSERT_NO_VALUE(result);
     ASSERT_EQ(fake->get_calls, 1);
@@ -519,9 +574,11 @@ TEST(di_forwards_get) {
 
 // S2-19.
 TEST(di_forwards_del) {
+    TEMP_WAL(guard);
     auto* fake = new FakeStorage();
     auto ptr = std::unique_ptr<forgekv::Storage>(fake);
-    forgekv::KeyValueStore store(std::move(ptr));
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(ptr), std::move(wal));
     bool removed = store.del("k");
     ASSERT_FALSE(removed);
     ASSERT_EQ(fake->exists_calls, 1);
@@ -530,9 +587,11 @@ TEST(di_forwards_del) {
 
 // S2-20.
 TEST(di_forwards_exists) {
+    TEMP_WAL(guard);
     auto* fake = new FakeStorage();
     auto ptr = std::unique_ptr<forgekv::Storage>(fake);
-    forgekv::KeyValueStore store(std::move(ptr));
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(ptr), std::move(wal));
     bool found = store.exists("k");
     ASSERT_FALSE(found);
     ASSERT_EQ(fake->exists_calls, 1);
@@ -540,9 +599,11 @@ TEST(di_forwards_exists) {
 
 // S2-21.
 TEST(di_forwards_utility_methods) {
+    TEMP_WAL(guard);
     auto* fake = new FakeStorage();
     auto ptr = std::unique_ptr<forgekv::Storage>(fake);
-    forgekv::KeyValueStore store(std::move(ptr));
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(ptr), std::move(wal));
     ASSERT_EQ(store.size(), std::size_t{0});
     ASSERT_TRUE(store.empty());
     store.clear();
@@ -566,31 +627,6 @@ TEST(di_forwards_utility_methods) {
 //
 // All tests use temporary files and clean up on exit.
 // =============================================================================
-
-// Helper: read the entire content of a file into a vector of bytes.
-static std::vector<std::uint8_t> read_file_bytes(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) {
-        throw std::runtime_error("read_file_bytes: cannot open: " + path);
-    }
-    return std::vector<std::uint8_t>(
-        std::istreambuf_iterator<char>(f),
-        std::istreambuf_iterator<char>());
-}
-
-// Helper: RAII guard that deletes a file on scope exit.
-struct TempFile {
-    std::string path;
-    explicit TempFile(std::string p) : path(std::move(p)) {}
-    ~TempFile() {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-    }
-};
-
-// Unique temp WAL path per test.
-#define TEMP_WAL(name) \
-    TempFile name{"test_wal_" #name ".wal"}
 
 // ---------------------------------------------------------------------------
 // S3-1. WAL creates a new file if it does not exist.
@@ -1538,6 +1574,631 @@ TEST(s4_existing_behavior_continues) {
 }
 
 // =============================================================================
+// Stage 5 tests — Crash Recovery / WAL Replay
+// =============================================================================
+//
+// All Stage 5 tests use temporary WAL files to ensure full isolation.
+// No test relies on manually created repository files.
+// All temporary files are cleaned up via RAII (TempFile).
+//
+// Helpers used:
+//   write_wal_records(path, fn)  — write records via a WAL, then close it
+//   make_store(path)             — open a KeyValueStore with DI WAL at path
+//   corrupt_bytes(path, offset, count, xor_mask) — flip bytes in a file
+//   truncate_file(path, keep_bytes) — shrink a file to N bytes
+// =============================================================================
+
+// Helper: build a WAL at path, invoke fn(wal), then let wal go out of scope.
+static void write_wal_records(const std::string& path,
+                               std::function<void(forgekv::WAL&)> fn)
+{
+    forgekv::WAL wal(path);
+    fn(wal);
+}
+
+// Helper: open a fully-DI KeyValueStore backed by InMemoryStorage + WAL at path.
+static forgekv::KeyValueStore make_store(const std::string& path)
+{
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(path);
+    return forgekv::KeyValueStore(std::move(storage), std::move(wal));
+}
+
+// Helper: XOR-flip `count` bytes at `offset` in the file at `path`.
+static void corrupt_bytes(const std::string& path,
+                           std::size_t offset,
+                           std::size_t count = 1,
+                           std::uint8_t xor_mask = 0xFF)
+{
+    auto bytes = read_file_bytes(path);
+    for (std::size_t i = offset; i < offset + count && i < bytes.size(); ++i) {
+        bytes[i] ^= xor_mask;
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+}
+
+// Helper: truncate file to `keep_bytes` bytes.
+static void truncate_file(const std::string& path, std::size_t keep_bytes)
+{
+    auto bytes = read_file_bytes(path);
+    if (keep_bytes < bytes.size()) {
+        bytes.resize(keep_bytes);
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+}
+
+// ---------------------------------------------------------------------------
+// S5-1. Empty/new WAL starts successfully — Storage is empty.
+// ---------------------------------------------------------------------------
+TEST(s5_empty_wal_starts_successfully) {
+    TEMP_WAL(guard);
+    std::filesystem::remove(guard.path); // ensure file does not exist
+    auto store = make_store(guard.path);
+    ASSERT_TRUE(store.empty());
+    ASSERT_EQ(store.size(), std::size_t{0});
+}
+
+// ---------------------------------------------------------------------------
+// S5-2. Existing WAL with one SET is recovered.
+// ---------------------------------------------------------------------------
+TEST(s5_single_set_recovered) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("name", "Vishnu");
+    });
+    auto store = make_store(guard.path);
+    auto v = store.get("name");
+    ASSERT_HAS_VALUE(v);
+    ASSERT_EQ(*v, "Vishnu");
+}
+
+// ---------------------------------------------------------------------------
+// S5-3. Multiple SET operations are recovered.
+// ---------------------------------------------------------------------------
+TEST(s5_multiple_sets_recovered) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("name", "Vishnu");
+        wal.append_set("age", "21");
+        wal.append_set("city", "Bengaluru");
+    });
+    auto store = make_store(guard.path);
+    ASSERT_EQ(*store.get("name"), "Vishnu");
+    ASSERT_EQ(*store.get("age"), "21");
+    ASSERT_EQ(*store.get("city"), "Bengaluru");
+    ASSERT_EQ(store.size(), std::size_t{3});
+}
+
+// ---------------------------------------------------------------------------
+// S5-4. SET followed by SET on same key — final value wins.
+// ---------------------------------------------------------------------------
+TEST(s5_overwrite_same_key) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("x", "first");
+        wal.append_set("x", "second");
+    });
+    auto store = make_store(guard.path);
+    ASSERT_EQ(*store.get("x"), "second");
+    ASSERT_EQ(store.size(), std::size_t{1});
+}
+
+// ---------------------------------------------------------------------------
+// S5-5. SET followed by DEL removes the key.
+// ---------------------------------------------------------------------------
+TEST(s5_set_then_del_removes_key) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("name", "Vishnu");
+        wal.append_del("name");
+    });
+    auto store = make_store(guard.path);
+    ASSERT_FALSE(store.exists("name"));
+    ASSERT_TRUE(store.empty());
+}
+
+// ---------------------------------------------------------------------------
+// S5-6. SET + DEL + SET produces final value.
+// ---------------------------------------------------------------------------
+TEST(s5_set_del_set_final_value) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("x", "1");
+        wal.append_del("x");
+        wal.append_set("x", "3");
+    });
+    auto store = make_store(guard.path);
+    ASSERT_EQ(*store.get("x"), "3");
+    ASSERT_EQ(store.size(), std::size_t{1});
+}
+
+// ---------------------------------------------------------------------------
+// S5-7. CLEAR removes previously stored keys during recovery.
+// ---------------------------------------------------------------------------
+TEST(s5_clear_removes_prior_keys) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("a", "1");
+        wal.append_set("b", "2");
+        wal.append_clear();
+    });
+    auto store = make_store(guard.path);
+    ASSERT_TRUE(store.empty());
+    ASSERT_FALSE(store.exists("a"));
+    ASSERT_FALSE(store.exists("b"));
+}
+
+// ---------------------------------------------------------------------------
+// S5-8. CLEAR followed by SET restores only later data.
+// ---------------------------------------------------------------------------
+TEST(s5_clear_then_set_only_later_data) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("a", "1");
+        wal.append_set("b", "2");
+        wal.append_clear();
+        wal.append_set("c", "3");
+    });
+    auto store = make_store(guard.path);
+    ASSERT_FALSE(store.exists("a"));
+    ASSERT_FALSE(store.exists("b"));
+    ASSERT_TRUE(store.exists("c"));
+    ASSERT_EQ(*store.get("c"), "3");
+    ASSERT_EQ(store.size(), std::size_t{1});
+}
+
+// ---------------------------------------------------------------------------
+// S5-9. Mixed SET/DEL/CLEAR sequence reproduces expected final state.
+// ---------------------------------------------------------------------------
+TEST(s5_mixed_sequence_final_state) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("name",    "Vishnu");
+        wal.append_set("age",     "21");
+        wal.append_set("city",    "Bengaluru");
+        wal.append_del("age");
+        wal.append_set("project", "ForgeKV");
+    });
+    auto store = make_store(guard.path);
+    ASSERT_EQ(*store.get("name"),    "Vishnu");
+    ASSERT_FALSE(store.exists("age"));
+    ASSERT_EQ(*store.get("city"),    "Bengaluru");
+    ASSERT_EQ(*store.get("project"), "ForgeKV");
+    ASSERT_EQ(store.size(), std::size_t{3});
+}
+
+// ---------------------------------------------------------------------------
+// S5-10. Recovery preserves key/value special characters.
+// ---------------------------------------------------------------------------
+TEST(s5_special_chars_recovered) {
+    TEMP_WAL(guard);
+    const std::string key   = "key|with|pipes\nand\nnewlines\r\n";
+    const std::string value = "val with spaces\t\r\n|and|pipes\\slash";
+    write_wal_records(guard.path, [&](forgekv::WAL& wal) {
+        wal.append_set(key, value);
+    });
+    auto store = make_store(guard.path);
+    ASSERT_TRUE(store.exists(key));
+    ASSERT_EQ(*store.get(key), value);
+}
+
+// ---------------------------------------------------------------------------
+// S5-11. Recovery reads WAL in strict file order.
+//   Three overwrites of key "x" — final value must be the last one written.
+// ---------------------------------------------------------------------------
+TEST(s5_replay_strict_file_order) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("x", "alpha");
+        wal.append_set("x", "beta");
+        wal.append_set("x", "gamma");
+    });
+    auto store = make_store(guard.path);
+    ASSERT_EQ(*store.get("x"), "gamma");
+}
+
+// ---------------------------------------------------------------------------
+// S5-12. Recovery does not append new WAL records.
+//   The WAL file size must not change after opening for recovery.
+// ---------------------------------------------------------------------------
+TEST(s5_recovery_does_not_append_wal_records) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("a", "1");
+        wal.append_set("b", "2");
+    });
+
+    const std::size_t size_before = read_file_bytes(guard.path).size();
+
+    // Open for recovery only — do not call any mutations.
+    {
+        auto store = make_store(guard.path);
+        // Read-only: recovery should not have grown the file.
+        (void)store.get("a");
+        (void)store.exists("b");
+    }
+
+    const std::size_t size_after = read_file_bytes(guard.path).size();
+    ASSERT_EQ(size_after, size_before);
+}
+
+// ---------------------------------------------------------------------------
+// S5-13. After recovery, a new mutation appends to the existing WAL.
+// ---------------------------------------------------------------------------
+TEST(s5_new_mutation_appends_after_recovery) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("name", "Vishnu");
+    });
+
+    const std::size_t size_before = read_file_bytes(guard.path).size();
+
+    {
+        auto store = make_store(guard.path);
+        ASSERT_EQ(*store.get("name"), "Vishnu"); // recovered
+        store.set("city", "Bengaluru");          // new mutation
+    }
+
+    const std::size_t size_after = read_file_bytes(guard.path).size();
+    ASSERT_TRUE(size_after > size_before); // WAL grew
+}
+
+// ---------------------------------------------------------------------------
+// S5-14. Reopen after new mutation recovers the complete state again.
+//   (Round-trip: write → close → recover → write more → close → recover)
+// ---------------------------------------------------------------------------
+TEST(s5_reopen_after_new_mutation) {
+    TEMP_WAL(guard);
+
+    // First lifetime: write name + age + DEL age + project.
+    {
+        auto store = make_store(guard.path);
+        store.set("name",    "Vishnu");
+        store.set("age",     "21");
+        store.del("age");
+        store.set("project", "ForgeKV");
+    }
+
+    // Second lifetime: recover, verify, add city.
+    {
+        auto store = make_store(guard.path);
+        ASSERT_EQ(*store.get("name"),    "Vishnu");
+        ASSERT_FALSE(store.exists("age"));
+        ASSERT_EQ(*store.get("project"), "ForgeKV");
+        store.set("city", "Bengaluru");
+    }
+
+    // Third lifetime: recover again, verify complete state.
+    {
+        auto store = make_store(guard.path);
+        ASSERT_EQ(*store.get("name"),    "Vishnu");
+        ASSERT_FALSE(store.exists("age"));
+        ASSERT_EQ(*store.get("project"), "ForgeKV");
+        ASSERT_EQ(*store.get("city"),    "Bengaluru");
+        ASSERT_EQ(store.size(), std::size_t{3});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S5-15. Checksum corruption causes recovery failure.
+// ---------------------------------------------------------------------------
+TEST(s5_checksum_corruption_fails_recovery) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("name", "Vishnu");
+    });
+    // Corrupt a payload byte (first key byte at offset 14).
+    corrupt_bytes(guard.path, 14);
+    ASSERT_THROWS(make_store(guard.path));
+}
+
+// ---------------------------------------------------------------------------
+// S5-16. Invalid magic causes recovery failure.
+// ---------------------------------------------------------------------------
+TEST(s5_invalid_magic_fails_recovery) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("k", "v");
+    });
+    // Overwrite magic bytes at offset 0.
+    auto bytes = read_file_bytes(guard.path);
+    bytes[0] = 0xDE; bytes[1] = 0xAD; bytes[2] = 0xBE; bytes[3] = 0xEF;
+    {
+        std::ofstream out(guard.path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    ASSERT_THROWS(make_store(guard.path));
+}
+
+// ---------------------------------------------------------------------------
+// S5-17. Invalid version causes recovery failure.
+// ---------------------------------------------------------------------------
+TEST(s5_invalid_version_fails_recovery) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("k", "v");
+    });
+    // Version byte is at offset 4.
+    corrupt_bytes(guard.path, 4);
+    ASSERT_THROWS(make_store(guard.path));
+}
+
+// ---------------------------------------------------------------------------
+// S5-18. Invalid opcode causes recovery failure.
+// ---------------------------------------------------------------------------
+TEST(s5_invalid_opcode_fails_recovery) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("k", "v");
+    });
+    // Opcode byte is at offset 5.
+    corrupt_bytes(guard.path, 5);
+    ASSERT_THROWS(make_store(guard.path));
+}
+
+// ---------------------------------------------------------------------------
+// S5-19. Malformed/invalid lengths cause recovery failure.
+//   Corrupt the val_len field to 0 in a SET record that has a non-empty value.
+//   The parser reads the wrong number of payload bytes and then reads the wrong
+//   bytes as the CRC, causing a checksum mismatch → recovery failure.
+// ---------------------------------------------------------------------------
+TEST(s5_invalid_lengths_fail_recovery) {
+    TEMP_WAL(guard);
+    // Use a key and value that are distinct in size so changing lengths
+    // always causes a checksum mismatch.
+    // append_set("hello","world"): key_len=5, val_len=5, total=28 bytes.
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("hello", "world");
+    });
+    // Corrupt val_len (bytes 10-13) to 0.
+    // Parser will now read only key_len=5 as payload, then read 4 bytes
+    // from where "world" starts as the CRC field.  The CRC computed over
+    // (modified header + key) will not match the value read as checksum.
+    auto bytes = read_file_bytes(guard.path);
+    ASSERT_TRUE(bytes.size() >= 14);
+    bytes[10] = 0x00; // val_len byte 0 → 0
+    bytes[11] = 0x00;
+    bytes[12] = 0x00;
+    bytes[13] = 0x00;
+    {
+        std::ofstream out(guard.path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    ASSERT_THROWS(make_store(guard.path));
+}
+
+// ---------------------------------------------------------------------------
+// S5-20. Truncated final record is not replayed.
+// ---------------------------------------------------------------------------
+TEST(s5_truncated_final_record_not_replayed) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("safe", "value");
+        wal.append_set("partial", "shouldnotappear");
+    });
+
+    // Truncate the file so the second record is only partially written.
+    // Each record for SET("safe","value"):  18 + 4 + 5 = 27 bytes.
+    // Each record for SET("partial","shouldnotappear"): 18 + 7 + 15 = 40 bytes.
+    // Keep the first record intact (27 bytes) + first 10 bytes of the second.
+    const std::size_t keep = 27 + 10;
+    truncate_file(guard.path, keep);
+
+    // Recovery must succeed (truncated final record = non-fatal).
+    auto store = make_store(guard.path);
+
+    // "safe" must be present (complete record).
+    ASSERT_EQ(*store.get("safe"), "value");
+
+    // "partial" must NOT be present (incomplete record not applied).
+    ASSERT_FALSE(store.exists("partial"));
+}
+
+// ---------------------------------------------------------------------------
+// S5-21. Valid records before a truncated final record are recovered.
+// ---------------------------------------------------------------------------
+TEST(s5_valid_records_before_truncated_final_recovered) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("a", "1");
+        wal.append_set("b", "2");
+        wal.append_set("c", "3");
+        wal.append_set("truncated_key", "truncated_value");
+    });
+
+    // Sizes: SET("a","1") = 18+1+1=20, SET("b","2") = 20, SET("c","3") = 20.
+    // Total complete = 60 bytes; truncate to 60 + 5 bytes (partial 4th record).
+    truncate_file(guard.path, 65);
+
+    auto store = make_store(guard.path);
+    ASSERT_EQ(*store.get("a"), "1");
+    ASSERT_EQ(*store.get("b"), "2");
+    ASSERT_EQ(*store.get("c"), "3");
+    ASSERT_FALSE(store.exists("truncated_key"));
+    ASSERT_EQ(store.size(), std::size_t{3});
+}
+
+// ---------------------------------------------------------------------------
+// S5-22. Corruption in the middle of the WAL is fatal.
+// ---------------------------------------------------------------------------
+TEST(s5_mid_log_corruption_is_fatal) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("first",  "ok");
+        wal.append_set("second", "corrupt");
+        wal.append_set("third",  "ok");
+    });
+
+    // SET("first","ok") = 18+5+2 = 25 bytes.
+    // Corrupt a payload byte in the second record (offset 25 + 14 = 39).
+    corrupt_bytes(guard.path, 39);
+
+    ASSERT_THROWS(make_store(guard.path));
+}
+
+// ---------------------------------------------------------------------------
+// S5-23. Records after a corrupted record are NOT replayed.
+// ---------------------------------------------------------------------------
+TEST(s5_records_after_corruption_not_replayed) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("before", "visible");
+        wal.append_set("corrupted", "bad");
+        wal.append_set("after",  "invisible");
+    });
+
+    // SET("before","visible")  = 18+6+7  = 31 bytes.
+    // Corrupt a payload byte in the middle record at offset 31 + 14 = 45.
+    corrupt_bytes(guard.path, 45);
+
+    bool threw = false;
+    try {
+        auto store = make_store(guard.path);
+        // If we get here, recovery didn't throw — which is wrong.
+        // Verify "after" is NOT present (records past corruption skipped).
+        ASSERT_FALSE(store.exists("after"));
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    // Recovery must either throw OR at minimum not have replayed "after".
+    // The spec says it must throw.
+    ASSERT_TRUE(threw);
+}
+
+// ---------------------------------------------------------------------------
+// S5-24. Injected Storage receives recovery operations.
+//   Use a counting Storage to verify the right calls were made.
+// ---------------------------------------------------------------------------
+
+class TrackingStorage final : public forgekv::Storage {
+public:
+    std::vector<std::string> ops;
+    std::unordered_map<std::string, std::string> data;
+
+    void set(const std::string& k, const std::string& v) override {
+        ops.push_back("SET:" + k + "=" + v);
+        data[k] = v;
+    }
+    std::optional<std::string> get(const std::string& k) const override {
+        auto it = data.find(k);
+        return (it != data.end()) ? std::optional{it->second} : std::nullopt;
+    }
+    bool del(const std::string& k) override {
+        ops.push_back("DEL:" + k);
+        return data.erase(k) > 0;
+    }
+    bool exists(const std::string& k) const override { return data.count(k) > 0; }
+    std::size_t size() const override { return data.size(); }
+    bool empty() const override { return data.empty(); }
+    void clear() override { ops.push_back("CLEAR"); data.clear(); }
+};
+
+TEST(s5_injected_storage_receives_recovery_ops) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("name",    "Vishnu");
+        wal.append_set("age",     "21");
+        wal.append_del("age");
+        wal.append_clear();
+        wal.append_set("project", "ForgeKV");
+    });
+
+    auto* raw = new TrackingStorage();
+    auto storage = std::unique_ptr<forgekv::Storage>(raw);
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    // Recovery must have applied: SET name, SET age, DEL age, CLEAR, SET project.
+    ASSERT_EQ(raw->ops.size(), std::size_t{5});
+    ASSERT_EQ(raw->ops[0], "SET:name=Vishnu");
+    ASSERT_EQ(raw->ops[1], "SET:age=21");
+    ASSERT_EQ(raw->ops[2], "DEL:age");
+    ASSERT_EQ(raw->ops[3], "CLEAR");
+    ASSERT_EQ(raw->ops[4], "SET:project=ForgeKV");
+}
+
+// ---------------------------------------------------------------------------
+// S5-25. Recovery does not depend on InMemoryStorage — works with any Storage.
+// ---------------------------------------------------------------------------
+TEST(s5_recovery_works_with_any_storage) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("stage", "5");
+    });
+
+    // Use TrackingStorage (not InMemoryStorage) to prove independence.
+    auto* raw = new TrackingStorage();
+    auto storage = std::unique_ptr<forgekv::Storage>(raw);
+    auto wal = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    // Recovery applied the SET via the abstract Storage interface.
+    ASSERT_EQ(raw->ops.size(), std::size_t{1});
+    ASSERT_EQ(raw->ops[0], "SET:stage=5");
+}
+
+// ---------------------------------------------------------------------------
+// S5-26. Read-only operations after recovery do not modify WAL.
+// ---------------------------------------------------------------------------
+TEST(s5_readonly_ops_after_recovery_no_wal_write) {
+    TEMP_WAL(guard);
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("key", "value");
+    });
+
+    const std::size_t size_after_write = read_file_bytes(guard.path).size();
+
+    {
+        auto store = make_store(guard.path);
+        // Recovery runs here.  Then only reads.
+        (void)store.get("key");
+        (void)store.exists("key");
+        (void)store.size();
+        (void)store.empty();
+    }
+
+    const std::size_t size_after_reads = read_file_bytes(guard.path).size();
+    ASSERT_EQ(size_after_reads, size_after_write);
+}
+
+// ---------------------------------------------------------------------------
+// S5-27. Repeated reopen/recovery is deterministic.
+//   Opening the same WAL multiple times produces the same state each time.
+// ---------------------------------------------------------------------------
+TEST(s5_repeated_recovery_is_deterministic) {
+    TEMP_WAL(guard);
+
+    // Write a fixed sequence of records once.
+    write_wal_records(guard.path, [](forgekv::WAL& wal) {
+        wal.append_set("a", "apple");
+        wal.append_set("b", "banana");
+        wal.append_del("b");
+        wal.append_set("c", "cherry");
+    });
+
+    // Open and recover three times independently.
+    for (int i = 0; i < 3; ++i) {
+        auto store = make_store(guard.path);
+        ASSERT_EQ(*store.get("a"), "apple");
+        ASSERT_FALSE(store.exists("b"));
+        ASSERT_EQ(*store.get("c"), "cherry");
+        ASSERT_EQ(store.size(), std::size_t{2});
+    }
+
+    // File size must be unchanged — recovery never appended anything.
+    // Just re-open once more and verify.
+    const std::size_t size_before = read_file_bytes(guard.path).size();
+    { auto store = make_store(guard.path); (void)store.size(); }
+    ASSERT_EQ(read_file_bytes(guard.path).size(), size_before);
+}
+
+// =============================================================================
 // Test runner
 // =============================================================================
 
@@ -1546,7 +2207,7 @@ int main() {
     int passed = 0;
     int failed  = 0;
 
-    std::cout << "\nForgeKV Stage 1 + 2 + 3 + 4 — KeyValueStore & WAL Tests\n";
+    std::cout << "\nForgeKV Stage 1 + 2 + 3 + 4 + 5 — KeyValueStore, WAL & Recovery Tests\n";
     std::cout << std::string(57, '=') << "\n\n";
 
     for (const auto& tc : tests) {

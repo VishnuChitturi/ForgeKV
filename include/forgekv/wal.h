@@ -127,6 +127,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -235,9 +236,53 @@ public:
     // The stream position advances by exactly one record on success.
     // On failure the stream state is undefined.
     //
-    // Stage 5 will call this function to replay records into Storage.
+    // Stage 5 calls this function to replay records into Storage.
     // Stage 4 only validates; it does NOT modify any in-memory state.
     static WalRecord read_record(std::istream& in);
+
+    // =========================================================================
+    // Stage 5: WAL replay
+    // =========================================================================
+    //
+    // replay() reads the WAL file from the beginning, invoking callback once
+    // for each complete, valid record in strict file order.
+    //
+    // Termination rules:
+    //
+    //   CLEAN EOF — no bytes of a new record are pending:
+    //       replay returns normally; incomplete_tail = false.
+    //
+    //   TRUNCATED FINAL RECORD — EOF occurs while reading the very last
+    //       (incomplete) record, and no subsequent complete records exist:
+    //       replay returns normally after applying all prior valid records;
+    //       incomplete_tail = true.  The incomplete record is NOT applied.
+    //
+    //   MID-LOG CORRUPTION or truncation before the final record:
+    //       std::runtime_error is thrown.  Storage is in a partially-
+    //       replayed state and must not be used.
+    //
+    // The callback receives a const WalRecord& and applies the operation to
+    // Storage (or any other target).  The callback must not throw.
+    //
+    // This function does NOT write to the WAL.  It opens the WAL file for
+    // reading independently of the WAL's own append-mode stream.
+
+    struct ReplayResult {
+        std::size_t records_replayed{0};   // number of complete records applied
+        bool        incomplete_tail{false}; // true if a truncated final record
+                                            // was skipped at EOF
+    };
+
+    // Replay all complete, valid records from the WAL file.
+    //
+    // Throws std::runtime_error if:
+    //   - The WAL file cannot be opened for reading.
+    //   - Any complete record contains an invalid magic, version, opcode, or
+    //     a checksum mismatch.
+    //   - A truncated record is encountered that is NOT at the very end of the
+    //     file (mid-log truncation is treated as fatal corruption).
+    [[nodiscard]] ReplayResult
+    replay(std::function<void(const WalRecord&)> callback) const;
 
     // -------------------------------------------------------------------------
     // Accessors

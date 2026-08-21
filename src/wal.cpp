@@ -352,4 +352,105 @@ WalRecord WAL::read_record(std::istream& in) {
     return rec;
 }
 
+// =============================================================================
+// replay — read all complete valid records from the WAL file and invoke
+//           callback for each one, in strict file order.
+// =============================================================================
+//
+// Truncation detection strategy:
+//
+//   read_record() throws std::runtime_error with a message starting with
+//   "WAL: truncated record (" whenever it hits an unexpected EOF.  Any other
+//   error message indicates a structural corruption (bad magic, bad version,
+//   bad opcode, checksum mismatch) in an otherwise complete record.
+//
+//   When a truncation exception is caught, we inspect the input stream:
+//
+//     - If the stream's EOF flag is set (i.e., the read attempt reached the
+//       actual end of the file), the incomplete record is the LAST entry in
+//       the file — this is a normal crash tail.  We stop replay, set
+//       incomplete_tail = true, and return successfully.
+//
+//     - If the EOF flag is NOT set (the truncated record is followed by more
+//       bytes), the corruption is mid-log and is treated as fatal.  We rethrow
+//       a descriptive error.  The caller must not trust the partial state.
+//
+//   In both truncation cases all previously replayed records are already in
+//   Storage, but the current incomplete record is NOT applied.
+//
+// WAL duplication prevention:
+//
+//   replay() opens the file with a fresh std::ifstream for reading only.
+//   It never touches the WAL's own append-mode stream_ and never calls any
+//   append_* function.  This guarantees that recovery cannot write new records.
+
+WAL::ReplayResult
+WAL::replay(std::function<void(const WalRecord&)> callback) const
+{
+    // Open the WAL file for reading from the beginning.
+    std::ifstream in(path_, std::ios::binary);
+    if (!in.is_open()) {
+        // If the file simply does not exist yet, replay is a no-op.
+        // An empty / new WAL is not an error.
+        return ReplayResult{};
+    }
+
+    ReplayResult result;
+
+    while (true) {
+        // Record the stream position before attempting to read.  This lets us
+        // distinguish a clean EOF (no bytes consumed) from a truncated record
+        // (some bytes consumed before EOF).
+        const std::streampos pos_before = in.tellg();
+
+        // Peek at the next byte.  If the stream is at EOF before we even begin
+        // reading a record, we are done — clean termination.
+        in.peek();
+        if (in.eof()) {
+            break; // clean EOF — no incomplete tail
+        }
+
+        // Attempt to read one complete record.
+        try {
+            WalRecord rec = read_record(in);
+            callback(rec);
+            ++result.records_replayed;
+        }
+        catch (const std::runtime_error& e) {
+            const std::string msg = e.what();
+            const bool is_truncation =
+                (msg.rfind("WAL: truncated record (", 0) == 0);
+
+            if (is_truncation) {
+                // Check whether we are at EOF (the incomplete record is the
+                // last thing in the file) or not (there are more bytes after
+                // this broken record — mid-log corruption).
+                if (in.eof()) {
+                    // Normal crash tail: a partial final record.
+                    // All prior records have already been applied.
+                    result.incomplete_tail = true;
+                    return result;
+                }
+                else {
+                    // Mid-log: a truncated record with data after it.
+                    // This is unrecoverable — stop and report.
+                    (void)pos_before; // suppress unused-variable warning
+                    throw std::runtime_error(
+                        "WAL: recovery failed — truncated record in the "
+                        "middle of the log (not at EOF); log may be corrupted");
+                }
+            }
+            else {
+                // Structural corruption in an otherwise complete record
+                // (bad magic, bad version, bad opcode, checksum mismatch).
+                // Always fatal regardless of position.
+                throw std::runtime_error(
+                    "WAL: recovery failed — " + msg);
+            }
+        }
+    }
+
+    return result;
+}
+
 } // namespace forgekv
