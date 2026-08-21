@@ -32,6 +32,8 @@
 
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace forgekv {
 
@@ -71,6 +73,18 @@ public:
 
     // CLEAR: Remove all key-value pairs. Storage is left valid and empty.
     virtual void clear() = 0;
+
+    // GET_ALL: Return a snapshot of all key-value pairs currently held.
+    //
+    // The returned vector contains one pair per live key. The ordering of
+    // entries is implementation-defined; callers that require deterministic
+    // ordering (e.g., compaction) must sort the result themselves.
+    //
+    // This is a read-only operation; it does not modify storage state.
+    // It is used by KeyValueStore::compact() to obtain the current live
+    // state without scanning the historical WAL.
+    [[nodiscard]] virtual std::vector<std::pair<std::string, std::string>>
+    get_all() const = 0;
 
     // -------------------------------------------------------------------------
     // Non-copyable, non-movable base.

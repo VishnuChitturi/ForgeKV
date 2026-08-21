@@ -180,6 +180,34 @@ public:
     // Throws std::runtime_error if the WAL write fails (in-memory unchanged).
     void clear();
 
+    // -------------------------------------------------------------------------
+    // Stage 8: Log Compaction
+    // -------------------------------------------------------------------------
+
+    // COMPACT: Rewrite the WAL to contain only the current live state.
+    //
+    // This eliminates all historical, redundant, and obsolete records from the
+    // WAL, reducing both its file size and future recovery time.
+    //
+    // Compaction is a write operation that holds the exclusive lock for its
+    // entire duration, ensuring that:
+    //   - No concurrent SET/DELETE/CLEAR can modify the state mid-compaction.
+    //   - No concurrent WAL append can interleave with the atomic file replace.
+    //   - Readers cannot observe an inconsistent intermediate state.
+    //
+    // The resulting compacted WAL contains exactly one SET record per live key.
+    // Keys that have been deleted are not written.
+    // Records are written in lexicographic key order for determinism.
+    //
+    // After compaction, the store's in-memory state is unchanged and the WAL
+    // stream points to the new, compacted file.  Subsequent SET/DELETE/CLEAR
+    // operations append to the compacted WAL normally.
+    //
+    // Throws std::runtime_error if the compaction fails (e.g., temp file
+    // cannot be created, rename fails, or WAL reopen fails).  On failure
+    // before the rename, the original WAL is preserved intact.
+    void compact();
+
 private:
     // -------------------------------------------------------------------------
     // Recovery helper

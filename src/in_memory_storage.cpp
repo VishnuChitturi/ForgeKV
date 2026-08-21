@@ -77,4 +77,19 @@ void InMemoryStorage::clear() {
     store_.clear();
 }
 
+// -----------------------------------------------------------------------------
+// get_all
+// -----------------------------------------------------------------------------
+// Returns all live key-value pairs as a vector of (key, value) pairs.
+// The result is NOT sorted here; deterministic ordering is the responsibility
+// of the caller (e.g., KeyValueStore::compact() sorts before writing the WAL).
+std::vector<std::pair<std::string, std::string>> InMemoryStorage::get_all() const {
+    std::vector<std::pair<std::string, std::string>> result;
+    result.reserve(store_.size());
+    for (const auto& [key, value] : store_) {
+        result.emplace_back(key, value);
+    }
+    return result;
+}
+
 } // namespace forgekv

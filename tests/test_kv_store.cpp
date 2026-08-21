@@ -21,6 +21,7 @@
 #include "forgekv/in_memory_storage.h"
 #include "forgekv/wal.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -33,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // -----------------------------------------------------------------------------
@@ -375,6 +377,9 @@ public:
     std::size_t size() const override { ++size_calls; return 0; }
     bool empty() const override { ++empty_calls; return true; }
     void clear() override { ++clear_calls; }
+    std::vector<std::pair<std::string, std::string>> get_all() const override {
+        return {};
+    }
 };
 
 // =============================================================================
@@ -2100,6 +2105,12 @@ public:
     std::size_t size() const override { return data.size(); }
     bool empty() const override { return data.empty(); }
     void clear() override { ops.push_back("CLEAR"); data.clear(); }
+    std::vector<std::pair<std::string, std::string>> get_all() const override {
+        std::vector<std::pair<std::string, std::string>> result;
+        result.reserve(data.size());
+        for (const auto& [k, v] : data) { result.emplace_back(k, v); }
+        return result;
+    }
 };
 
 TEST(s5_injected_storage_receives_recovery_ops) {
@@ -2612,6 +2623,718 @@ TEST(s7_concurrent_clear_with_readers_writers) {
 }
 
 // =============================================================================
+// Stage 8 Tests — Log Compaction
+// =============================================================================
+//
+// These tests verify WAL compaction behavior:
+//   - Correct logical state preservation
+//   - Atomic WAL replacement
+//   - WAL size reduction
+//   - Recovery after compaction
+//   - Writes after compaction followed by recovery (stream reopen)
+//   - Edge cases: empty store, single key, large state
+//   - Concurrent access safety
+//
+// All tests use temporary WAL files and clean up via RAII (TempFile).
+// Verification uses existing WAL replay/parsing infrastructure rather
+// than duplicating the binary parser.
+//
+// Helper: replay a WAL file and return the resulting logical state.
+// Returns a sorted vector of (key, value) pairs for deterministic comparison.
+static std::vector<std::pair<std::string, std::string>>
+replay_to_state(const std::string& wal_path)
+{
+    std::unordered_map<std::string, std::string> state;
+
+    forgekv::WAL wal(wal_path);
+    (void)wal.replay([&](const forgekv::WalRecord& rec) {
+        switch (rec.opcode) {
+            case forgekv::kOpSet:
+                state[rec.key] = rec.value;
+                break;
+            case forgekv::kOpDel:
+                state.erase(rec.key);
+                break;
+            case forgekv::kOpClear:
+                state.clear();
+                break;
+            default:
+                break;
+        }
+    });
+
+    std::vector<std::pair<std::string, std::string>> result;
+    result.reserve(state.size());
+    for (const auto& [k, v] : state) {
+        result.emplace_back(k, v);
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+// Helper: count WAL records by replaying.
+static std::size_t count_wal_records(const std::string& wal_path)
+{
+    std::size_t count = 0;
+    std::ifstream f(wal_path, std::ios::binary);
+    if (!f.is_open()) return 0;
+    while (true) {
+        f.peek();
+        if (f.eof()) break;
+        try {
+            forgekv::WAL::read_record(f);
+            ++count;
+        } catch (...) {
+            break;
+        }
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// S8-1. Basic compaction: state unchanged, WAL shrinks.
+//
+//   Write several updates/deletes, compact, verify logical state unchanged
+//   and WAL file is smaller than before compaction.
+// ---------------------------------------------------------------------------
+TEST(s8_basic_compaction_state_unchanged) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    store.set("user", "Vishnu");
+    store.set("user", "Rahul");
+    store.set("user", "Alex");
+    store.set("age",  "20");
+    store.set("age",  "21");
+    store.del("old_key");   // del of nonexistent: no WAL record
+    store.set("city", "Bangalore");
+    store.set("city", "Mysore");
+
+    const std::size_t size_before = read_file_bytes(guard.path).size();
+
+    // Capture pre-compaction state.
+    ASSERT_EQ(*store.get("user"), "Alex");
+    ASSERT_EQ(*store.get("age"),  "21");
+    ASSERT_EQ(*store.get("city"), "Mysore");
+    ASSERT_EQ(store.size(), std::size_t{3});
+
+    store.compact();
+
+    // Logical state must be identical after compaction.
+    ASSERT_EQ(*store.get("user"), "Alex");
+    ASSERT_EQ(*store.get("age"),  "21");
+    ASSERT_EQ(*store.get("city"), "Mysore");
+    ASSERT_EQ(store.size(), std::size_t{3});
+    ASSERT_FALSE(store.exists("old_key"));
+
+    const std::size_t size_after = read_file_bytes(guard.path).size();
+    // 7 records written → compact to 3 records: WAL must shrink.
+    ASSERT_TRUE(size_after < size_before);
+}
+
+// ---------------------------------------------------------------------------
+// S8-2. Repeated updates — only final value survives compaction.
+//
+//   SET A=1..100, then compact.
+//   WAL must contain only 1 record for A with value "100".
+// ---------------------------------------------------------------------------
+TEST(s8_repeated_updates_compacted_to_one) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    for (int i = 1; i <= 100; ++i) {
+        store.set("A", std::to_string(i));
+    }
+
+    const std::size_t size_before = read_file_bytes(guard.path).size();
+    ASSERT_EQ(*store.get("A"), "100");
+
+    store.compact();
+
+    ASSERT_EQ(*store.get("A"), "100");
+    ASSERT_EQ(store.size(), std::size_t{1});
+
+    const std::size_t size_after = read_file_bytes(guard.path).size();
+    // 100 records → 1 record: significant size reduction.
+    ASSERT_TRUE(size_after < size_before);
+
+    // WAL must contain exactly 1 record.
+    ASSERT_EQ(count_wal_records(guard.path), std::size_t{1});
+
+    // Verify via replay.
+    auto replayed = replay_to_state(guard.path);
+    ASSERT_EQ(replayed.size(), std::size_t{1});
+    ASSERT_EQ(replayed[0].first,  "A");
+    ASSERT_EQ(replayed[0].second, "100");
+}
+
+// ---------------------------------------------------------------------------
+// S8-3. Deleted keys do not appear in the compacted WAL.
+//
+//   SET A=1, DEL A.  After compact: A absent, WAL has 0 records.
+// ---------------------------------------------------------------------------
+TEST(s8_deleted_key_not_in_compacted_wal) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    store.set("A", "1");
+    store.del("A");
+
+    ASSERT_FALSE(store.exists("A"));
+    ASSERT_TRUE(store.empty());
+
+    store.compact();
+
+    ASSERT_FALSE(store.exists("A"));
+    ASSERT_TRUE(store.empty());
+
+    // WAL must be empty (no live keys).
+    ASSERT_EQ(count_wal_records(guard.path), std::size_t{0});
+
+    // Replay confirms empty state.
+    auto replayed = replay_to_state(guard.path);
+    ASSERT_TRUE(replayed.empty());
+}
+
+// ---------------------------------------------------------------------------
+// S8-4. Mixed keys — correct final state preserved.
+//
+//   Many keys with repeated updates and deletes.
+//   Capture pre-compaction state, compact, verify exact match.
+// ---------------------------------------------------------------------------
+TEST(s8_mixed_keys_correct_state) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    // Build complex history.
+    for (int i = 0; i < 20; ++i) {
+        store.set("key" + std::to_string(i), "val_v1_" + std::to_string(i));
+    }
+    for (int i = 0; i < 10; ++i) {
+        store.set("key" + std::to_string(i), "val_v2_" + std::to_string(i));
+    }
+    // Delete even-indexed keys from 0..9.
+    for (int i = 0; i < 10; i += 2) {
+        store.del("key" + std::to_string(i));
+    }
+
+    // Capture expected state before compaction.
+    std::vector<std::pair<std::string, std::string>> expected;
+    for (int i = 0; i < 20; ++i) {
+        const std::string key = "key" + std::to_string(i);
+        auto val = store.get(key);
+        if (val.has_value()) {
+            expected.emplace_back(key, *val);
+        }
+    }
+    std::sort(expected.begin(), expected.end());
+    const std::size_t expected_count = expected.size();
+
+    store.compact();
+
+    // Verify every expected key/value matches exactly.
+    ASSERT_EQ(store.size(), expected_count);
+    for (const auto& [k, v] : expected) {
+        auto val = store.get(k);
+        ASSERT_HAS_VALUE(val);
+        ASSERT_EQ(*val, v);
+    }
+
+    // WAL record count must equal the number of live keys.
+    ASSERT_EQ(count_wal_records(guard.path), expected_count);
+
+    // Replay must reproduce the same state.
+    auto replayed = replay_to_state(guard.path);
+    ASSERT_EQ(replayed, expected);
+}
+
+// ---------------------------------------------------------------------------
+// S8-5. Recovery after compaction reproduces exact state.
+//
+//   Create state → compact → destroy store → recreate → verify.
+// ---------------------------------------------------------------------------
+TEST(s8_recovery_after_compaction) {
+    TEMP_WAL(guard);
+
+    // Phase 1: build state and compact.
+    {
+        auto store = make_store(guard.path);
+        store.set("name",    "Alice");
+        store.set("lang",    "C++");
+        store.set("stage",   "8");
+        store.set("name",    "Bob");    // update
+        store.del("lang");              // delete
+        store.set("project", "ForgeKV");
+
+        store.compact();
+
+        // Pre-verify in-memory state.
+        ASSERT_EQ(*store.get("name"),    "Bob");
+        ASSERT_FALSE(store.exists("lang"));
+        ASSERT_EQ(*store.get("stage"),   "8");
+        ASSERT_EQ(*store.get("project"), "ForgeKV");
+    }
+
+    // Phase 2: recreate store from compacted WAL.
+    {
+        auto store = make_store(guard.path);
+        ASSERT_EQ(*store.get("name"),    "Bob");
+        ASSERT_FALSE(store.exists("lang"));
+        ASSERT_EQ(*store.get("stage"),   "8");
+        ASSERT_EQ(*store.get("project"), "ForgeKV");
+        ASSERT_EQ(store.size(), std::size_t{3});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8-6. Writes after compaction persist correctly after recovery.
+//
+//   This tests the critical WAL-reopen invariant: after compact(), future
+//   SET/DELETE operations must append to the NEW WAL file.
+//
+//   Pattern: create → compact → write more → destroy → recreate → verify all.
+// ---------------------------------------------------------------------------
+TEST(s8_writes_after_compaction_persist) {
+    TEMP_WAL(guard);
+
+    // Phase 1: create initial state, compact, write more.
+    {
+        auto store = make_store(guard.path);
+        store.set("A", "1");
+        store.set("B", "2");
+        store.set("A", "3");  // update
+
+        store.compact();
+
+        // Now write more operations — these must go to the new WAL.
+        store.set("C", "4");
+        store.del("B");
+        store.set("D", "5");
+    }
+
+    // Phase 2: recover from WAL — must contain all post-compaction ops.
+    {
+        auto store = make_store(guard.path);
+        ASSERT_EQ(*store.get("A"), "3");
+        ASSERT_FALSE(store.exists("B"));
+        ASSERT_EQ(*store.get("C"), "4");
+        ASSERT_EQ(*store.get("D"), "5");
+        ASSERT_EQ(store.size(), std::size_t{3});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8-7. Compacting an empty store succeeds.
+//
+//   compact() on an empty store must not throw.
+//   WAL must be empty after compaction.
+//   Recovery produces an empty store.
+// ---------------------------------------------------------------------------
+TEST(s8_compact_empty_store) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    ASSERT_TRUE(store.empty());
+
+    // Must not throw.
+    store.compact();
+
+    ASSERT_TRUE(store.empty());
+    ASSERT_EQ(store.size(), std::size_t{0});
+
+    // WAL must have zero records.
+    ASSERT_EQ(count_wal_records(guard.path), std::size_t{0});
+
+    // Recovery from compacted empty WAL → empty store.
+    {
+        auto store2 = make_store(guard.path);
+        ASSERT_TRUE(store2.empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8-8. Compacting a single-key store.
+// ---------------------------------------------------------------------------
+TEST(s8_compact_single_key) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    store.set("only_key", "only_value");
+    store.set("only_key", "updated_value");  // update
+
+    store.compact();
+
+    ASSERT_EQ(*store.get("only_key"), "updated_value");
+    ASSERT_EQ(store.size(), std::size_t{1});
+    ASSERT_EQ(count_wal_records(guard.path), std::size_t{1});
+
+    // Verify via replay.
+    auto replayed = replay_to_state(guard.path);
+    ASSERT_EQ(replayed.size(), std::size_t{1});
+    ASSERT_EQ(replayed[0].first,  "only_key");
+    ASSERT_EQ(replayed[0].second, "updated_value");
+
+    // Recovery.
+    {
+        auto store2 = make_store(guard.path);
+        ASSERT_EQ(*store2.get("only_key"), "updated_value");
+        ASSERT_EQ(store2.size(), std::size_t{1});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8-9. Large state compaction — correctness under volume.
+//
+//   Insert N keys with multiple updates each, delete a subset, compact.
+//   Verify every surviving key/value exactly matches the pre-compaction state.
+// ---------------------------------------------------------------------------
+TEST(s8_large_state_compaction) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    const int N = 500;   // number of unique keys
+    const int U = 5;     // updates per key
+
+    // Write U versions of each key.
+    for (int u = 0; u < U; ++u) {
+        for (int i = 0; i < N; ++i) {
+            store.set("key" + std::to_string(i),
+                      "v" + std::to_string(u) + "_" + std::to_string(i));
+        }
+    }
+
+    // Delete keys divisible by 7.
+    for (int i = 0; i < N; i += 7) {
+        store.del("key" + std::to_string(i));
+    }
+
+    // Capture expected state.
+    std::vector<std::pair<std::string, std::string>> expected;
+    for (int i = 0; i < N; ++i) {
+        const std::string key = "key" + std::to_string(i);
+        auto val = store.get(key);
+        if (val.has_value()) {
+            expected.emplace_back(key, *val);
+        }
+    }
+    std::sort(expected.begin(), expected.end());
+    const std::size_t live_count = expected.size();
+
+    const std::size_t size_before = read_file_bytes(guard.path).size();
+
+    store.compact();
+
+    const std::size_t size_after = read_file_bytes(guard.path).size();
+    ASSERT_TRUE(size_after < size_before);
+    ASSERT_EQ(store.size(), live_count);
+    ASSERT_EQ(count_wal_records(guard.path), live_count);
+
+    // Spot-check first 50 surviving keys.
+    for (std::size_t i = 0; i < std::min(expected.size(), std::size_t{50}); ++i) {
+        auto val = store.get(expected[i].first);
+        ASSERT_HAS_VALUE(val);
+        ASSERT_EQ(*val, expected[i].second);
+    }
+
+    // Full replay verification.
+    auto replayed = replay_to_state(guard.path);
+    ASSERT_EQ(replayed, expected);
+
+    // Recovery verification.
+    {
+        auto store2 = make_store(guard.path);
+        ASSERT_EQ(store2.size(), live_count);
+        for (const auto& [k, v] : expected) {
+            auto val = store2.get(k);
+            ASSERT_HAS_VALUE(val);
+            ASSERT_EQ(*val, v);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8-10. Compact followed by immediate re-compact — idempotent.
+//
+//   Compacting an already-compact WAL must be a safe no-op from a
+//   correctness standpoint.  The WAL size stays the same (one record per key).
+// ---------------------------------------------------------------------------
+TEST(s8_double_compact_idempotent) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    store.set("x", "1");
+    store.set("y", "2");
+    store.set("x", "3");  // update
+
+    store.compact();
+    const std::size_t size_after_first = read_file_bytes(guard.path).size();
+
+    store.compact();
+    const std::size_t size_after_second = read_file_bytes(guard.path).size();
+
+    // Second compact writes same records → same file size.
+    ASSERT_EQ(size_after_first, size_after_second);
+
+    ASSERT_EQ(*store.get("x"), "3");
+    ASSERT_EQ(*store.get("y"), "2");
+    ASSERT_EQ(store.size(), std::size_t{2});
+}
+
+// ---------------------------------------------------------------------------
+// S8-11. WAL replay count equals live key count after compaction.
+//
+//   Precisely: after compact(), replaying the WAL must produce EXACTLY as
+//   many SET records as there are live keys, and zero DEL/CLEAR records.
+// ---------------------------------------------------------------------------
+TEST(s8_wal_record_count_equals_live_keys) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    store.set("a", "1");
+    store.set("b", "2");
+    store.set("c", "3");
+    store.del("b");
+    store.set("d", "4");
+
+    // Live keys: a, c, d → 3 keys.
+    ASSERT_EQ(store.size(), std::size_t{3});
+
+    store.compact();
+
+    // Replay and count records by opcode.
+    std::size_t set_count   = 0;
+    std::size_t del_count   = 0;
+    std::size_t clear_count = 0;
+
+    forgekv::WAL wal(guard.path);
+    (void)wal.replay([&](const forgekv::WalRecord& rec) {
+        switch (rec.opcode) {
+            case forgekv::kOpSet:   ++set_count;   break;
+            case forgekv::kOpDel:   ++del_count;   break;
+            case forgekv::kOpClear: ++clear_count; break;
+            default: break;
+        }
+    });
+
+    ASSERT_EQ(set_count,   std::size_t{3});  // exactly one per live key
+    ASSERT_EQ(del_count,   std::size_t{0});  // no DEL records
+    ASSERT_EQ(clear_count, std::size_t{0});  // no CLEAR records
+}
+
+// ---------------------------------------------------------------------------
+// S8-12. Compact + more writes + second compact → correct recovery.
+//
+//   Compact → add keys → compact again → recover → verify.
+//   Ensures the two-compact round-trip is fully durable.
+// ---------------------------------------------------------------------------
+TEST(s8_compact_write_compact_recover) {
+    TEMP_WAL(guard);
+
+    {
+        auto store = make_store(guard.path);
+        store.set("p", "1");
+        store.set("q", "2");
+        store.set("p", "10");   // update
+
+        store.compact();   // First compact: WAL = {p=10, q=2}
+
+        store.set("r", "3");
+        store.del("q");
+        store.set("s", "4");
+
+        store.compact();   // Second compact: WAL = {p=10, r=3, s=4}
+    }
+
+    {
+        auto store = make_store(guard.path);
+        ASSERT_EQ(*store.get("p"), "10");
+        ASSERT_FALSE(store.exists("q"));
+        ASSERT_EQ(*store.get("r"), "3");
+        ASSERT_EQ(*store.get("s"), "4");
+        ASSERT_EQ(store.size(), std::size_t{3});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8-13. Concurrent readers during compaction — no crashes, consistent state.
+//
+//   Strategy:
+//   - Pre-populate store.
+//   - Launch reader threads that repeatedly read all keys.
+//   - One thread performs compact() once.
+//   - All readers run before and after compaction.
+//   - After join: verify logical state is correct.
+//
+//   Uses std::latch for synchronized start (matching Stage 7 test style).
+//   No arbitrary sleeps. Correctness, not timing, is verified.
+// ---------------------------------------------------------------------------
+TEST(s8_concurrent_readers_during_compaction) {
+    TEMP_WAL(guard);
+
+    const int KEY_COUNT     = 30;
+    const int READER_THREADS = 6;
+    const int READ_ROUNDS   = 100;
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    // Seed store with multiple updates per key (to create compactable history).
+    for (int v = 0; v < 3; ++v) {
+        for (int i = 0; i < KEY_COUNT; ++i) {
+            store.set("key" + std::to_string(i),
+                      "val_v" + std::to_string(v) + "_" + std::to_string(i));
+        }
+    }
+
+    // Expected final value for each key (last written version = v2).
+    // These must survive and be readable before/after compaction.
+
+    std::latch ready(READER_THREADS + 1);  // +1 for compact thread
+    std::atomic<int> read_errors{0};
+    std::atomic<bool> compact_done{false};
+
+    std::vector<std::thread> threads;
+    threads.reserve(READER_THREADS + 1);
+
+    // Reader threads: read all keys before/after compaction.
+    for (int t = 0; t < READER_THREADS; ++t) {
+        threads.emplace_back([&]() {
+            ready.arrive_and_wait();
+
+            for (int r = 0; r < READ_ROUNDS; ++r) {
+                for (int i = 0; i < KEY_COUNT; ++i) {
+                    const std::string key = "key" + std::to_string(i);
+                    auto val = store.get(key);
+                    // Key must always exist (we never delete in this test).
+                    if (!val.has_value()) {
+                        read_errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    // Value must be non-empty.
+                    if (val.has_value() && val.value().empty()) {
+                        read_errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (!store.exists(key)) {
+                        read_errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+
+    // Compaction thread: compact once after all threads are ready.
+    threads.emplace_back([&]() {
+        ready.arrive_and_wait();
+        store.compact();
+        compact_done.store(true, std::memory_order_release);
+    });
+
+    for (auto& th : threads) { th.join(); }
+
+    ASSERT_TRUE(compact_done.load());
+    ASSERT_EQ(read_errors.load(), 0);
+
+    // Post-compaction state must match expected.
+    ASSERT_EQ(store.size(), static_cast<std::size_t>(KEY_COUNT));
+    for (int i = 0; i < KEY_COUNT; ++i) {
+        const std::string key      = "key" + std::to_string(i);
+        const std::string expected = "val_v2_" + std::to_string(i);
+        auto val = store.get(key);
+        ASSERT_HAS_VALUE(val);
+        ASSERT_EQ(*val, expected);
+    }
+
+    // Recovery after concurrent compaction must also be correct.
+    {
+        auto store2 = make_store(guard.path);
+        ASSERT_EQ(store2.size(), static_cast<std::size_t>(KEY_COUNT));
+        for (int i = 0; i < KEY_COUNT; ++i) {
+            const std::string key      = "key" + std::to_string(i);
+            const std::string expected = "val_v2_" + std::to_string(i);
+            auto val = store2.get(key);
+            ASSERT_HAS_VALUE(val);
+            ASSERT_EQ(*val, expected);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S8-14. get_all() on InMemoryStorage returns all live pairs.
+//
+//   Unit test for the new Storage::get_all() method directly on
+//   InMemoryStorage (not through KeyValueStore).
+// ---------------------------------------------------------------------------
+TEST(s8_get_all_basic) {
+    forgekv::InMemoryStorage s;
+    s.set("z", "3");
+    s.set("a", "1");
+    s.set("m", "2");
+
+    auto all = s.get_all();
+    // Three pairs returned.
+    ASSERT_EQ(all.size(), std::size_t{3});
+
+    // Sort for deterministic comparison.
+    std::sort(all.begin(), all.end());
+    ASSERT_EQ(all[0].first,  "a");
+    ASSERT_EQ(all[0].second, "1");
+    ASSERT_EQ(all[1].first,  "m");
+    ASSERT_EQ(all[1].second, "2");
+    ASSERT_EQ(all[2].first,  "z");
+    ASSERT_EQ(all[2].second, "3");
+}
+
+// ---------------------------------------------------------------------------
+// S8-15. get_all() on empty InMemoryStorage returns empty vector.
+// ---------------------------------------------------------------------------
+TEST(s8_get_all_empty) {
+    forgekv::InMemoryStorage s;
+    auto all = s.get_all();
+    ASSERT_TRUE(all.empty());
+}
+
+// ---------------------------------------------------------------------------
+// S8-16. Compact preserves deterministic key order in WAL.
+//
+//   After compact(), replaying the WAL must produce keys in
+//   lexicographic order (the order compact() writes them).
+// ---------------------------------------------------------------------------
+TEST(s8_compact_deterministic_order) {
+    TEMP_WAL(guard);
+    auto store = make_store(guard.path);
+
+    // Write in non-alphabetic order.
+    store.set("zebra",  "z");
+    store.set("apple",  "a");
+    store.set("mango",  "m");
+    store.set("banana", "b");
+
+    store.compact();
+
+    // Read WAL records in file order.
+    std::vector<std::string> keys_in_order;
+    auto f = open_binary(guard.path);
+    bool hit_end = false;
+    while (!hit_end) {
+        f.peek();
+        if (f.eof()) break;
+        try {
+            auto rec = forgekv::WAL::read_record(f);
+            keys_in_order.push_back(rec.key);
+        } catch (...) {
+            hit_end = true;
+        }
+    }
+
+    // Must be 4 records in lexicographic order.
+    ASSERT_EQ(keys_in_order.size(), std::size_t{4});
+    ASSERT_EQ(keys_in_order[0], "apple");
+    ASSERT_EQ(keys_in_order[1], "banana");
+    ASSERT_EQ(keys_in_order[2], "mango");
+    ASSERT_EQ(keys_in_order[3], "zebra");
+}
+
+// =============================================================================
 // Test runner
 // =============================================================================
 
@@ -2620,7 +3343,7 @@ int main() {
     int passed = 0;
     int failed  = 0;
 
-    std::cout << "\nForgeKV Stage 1–7 — KeyValueStore, WAL, Recovery & Concurrency Tests\n";
+    std::cout << "\nForgeKV Stage 1–8 — KeyValueStore, WAL, Recovery, Concurrency & Compaction Tests\n";
     std::cout << std::string(57, '=') << "\n\n";
 
     for (const auto& tc : tests) {

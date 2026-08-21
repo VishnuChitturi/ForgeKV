@@ -68,6 +68,9 @@ public:
 
     void clear() override;
 
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>>
+    get_all() const override;
+
 private:
     // The backing data structure.
     // Ownership lives here, not in KeyValueStore.

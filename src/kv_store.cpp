@@ -49,6 +49,7 @@
 #include "forgekv/in_memory_storage.h"
 #include "forgekv/recovery.h"
 
+#include <algorithm>
 #include <shared_mutex>
 
 namespace forgekv {
@@ -224,6 +225,49 @@ void KeyValueStore::clear()
     std::unique_lock lock(mutex_);
     wal_->append_clear(); // WAL write FIRST
     storage_->clear();    // in-memory wipe SECOND
+}
+
+// -----------------------------------------------------------------------------
+// compact
+// -----------------------------------------------------------------------------
+// Rewrites the WAL to contain only the current live key-value state.
+//
+// Locking:
+//   Acquires the exclusive lock for the full duration of compaction.
+//   This prevents any concurrent SET/DELETE/CLEAR from:
+//     - modifying storage_ while the snapshot is being taken
+//     - appending a new WAL record while the WAL file is being replaced
+//
+// Sequence (all under exclusive lock):
+//   1. Snapshot the current state via storage_->get_all().
+//   2. Sort the snapshot by key for deterministic record ordering.
+//   3. Delegate atomic WAL replacement to wal_->rewrite(snapshot).
+//      WAL::rewrite() writes the temp file, renames it over the original,
+//      and reopens stream_ to the new file.
+//   4. In-memory state is unchanged (no storage_ mutation occurs).
+//
+// On failure:
+//   wal_->rewrite() throws std::runtime_error.  The exception propagates
+//   out of compact().  The original WAL is preserved (if failure was before
+//   rename) or the compacted WAL is on disk (if failure was only the reopen).
+//   In-memory state is never modified by compact().
+void KeyValueStore::compact()
+{
+    std::unique_lock lock(mutex_);
+
+    // 1. Capture the complete current state.
+    auto snapshot = storage_->get_all();
+
+    // 2. Sort by key for deterministic WAL record order.
+    //    Deterministic ordering makes the compacted WAL reproducible and
+    //    simplifies test verification.
+    std::sort(snapshot.begin(), snapshot.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    // 3. Delegate to WAL: write temp file, atomic rename, reopen stream.
+    //    This may throw; if so, the lock is released and the exception
+    //    propagates to the caller.  Storage is unchanged.
+    wal_->rewrite(snapshot);
 }
 
 } // namespace forgekv

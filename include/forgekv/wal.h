@@ -126,9 +126,11 @@
 // =============================================================================
 
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace forgekv {
@@ -283,6 +285,60 @@ public:
     //     file (mid-log truncation is treated as fatal corruption).
     [[nodiscard]] ReplayResult
     replay(std::function<void(const WalRecord&)> callback) const;
+
+    // =========================================================================
+    // Stage 8: WAL compaction — atomic rewrite
+    // =========================================================================
+    //
+    // rewrite() atomically replaces the WAL file with a minimal compacted WAL
+    // containing exactly one SET record per live key/value pair.
+    //
+    // The snapshot parameter must contain the complete authoritative current
+    // state (provided by KeyValueStore::compact() under an exclusive lock).
+    // Each pair in the snapshot becomes one SET record in the new WAL.
+    // Deleted keys must NOT appear in the snapshot.
+    //
+    // Atomic replacement strategy:
+    //
+    //   1. Derive a temporary filename in the same directory as the WAL file
+    //      (same filesystem partition → rename is atomic at OS level).
+    //   2. Write all SET records to the temp file using write_record().
+    //   3. Flush and close the temp file.
+    //   4. Use std::filesystem::rename() to replace the original WAL file.
+    //      On POSIX systems rename() is atomic: readers either see the old
+    //      file or the new file, never a half-written state.
+    //   5. Reopen stream_ in binary append mode pointing to the new WAL file.
+    //      This is critical: the next append_set/append_del/append_clear must
+    //      write to the compacted file, not the old (now-replaced) inode.
+    //
+    // Failure handling:
+    //
+    //   If any step before the rename fails (temp file write error), the
+    //   original WAL is untouched.  The temp file is removed on best effort.
+    //   stream_ continues pointing at the original WAL.
+    //
+    //   If rename() fails, same: original WAL is untouched, temp file cleaned
+    //   up, stream_ unchanged.
+    //
+    //   If rename() succeeds but stream_ reopen fails (extremely unlikely):
+    //   std::runtime_error is thrown with a diagnostic; the compacted WAL is
+    //   on disk but the append stream is invalid.  The store must be
+    //   considered unusable at that point.
+    //
+    // Durability note:
+    //   This function does NOT fsync the WAL file or the directory entry.
+    //   The same durability level applies here as for normal WAL appends:
+    //   standard library buffered I/O is flushed via stream.flush().
+    //   A power loss between rename() and the next OS-level sync could, in
+    //   theory, leave the old or new WAL depending on filesystem journaling.
+    //   This matches the existing WAL durability model.
+    //
+    // Throws std::runtime_error if:
+    //   - The temporary file cannot be created.
+    //   - Any write or flush to the temporary file fails.
+    //   - std::filesystem::rename() fails (original WAL preserved).
+    //   - Reopening stream_ on the new WAL file fails.
+    void rewrite(const std::vector<std::pair<std::string, std::string>>& snapshot);
 
     // -------------------------------------------------------------------------
     // Accessors

@@ -41,6 +41,8 @@
 #include "forgekv/wal.h"
 
 #include <array>
+#include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <cstring>  // std::memcpy
 
@@ -451,6 +453,154 @@ WAL::replay(std::function<void(const WalRecord&)> callback) const
     }
 
     return result;
+}
+
+// =============================================================================
+// rewrite — atomically replace the WAL with a compacted snapshot
+// =============================================================================
+//
+// Strategy:
+//
+//   1. Build a temporary path in the same directory as path_ so that
+//      std::filesystem::rename() is guaranteed to be a same-partition
+//      atomic replace on POSIX systems.
+//
+//   2. Open the temp file for binary writing (truncate mode — it must start
+//      empty).  Write one SET record for every (key, value) pair in snapshot.
+//      Flush after each record (matching the normal WAL durability contract).
+//
+//   3. Close the temp file stream before rename to flush OS buffers.
+//
+//   4. std::filesystem::rename() atomically replaces path_ with the temp
+//      file.  If rename fails, the original path_ is untouched and the temp
+//      file is removed (best-effort).
+//
+//   5. Reopen stream_ in binary append mode on the new path_.  The old inode
+//      (which was atomically swapped out) is released.  All future
+//      append_set/append_del/append_clear operations now write to the new,
+//      compacted WAL.
+//
+// Note: this function is always called under KeyValueStore's exclusive
+// mutex_, so no additional synchronization is needed here.
+
+void WAL::rewrite(const std::vector<std::pair<std::string, std::string>>& snapshot)
+{
+    // -------------------------------------------------------------------------
+    // 1. Derive a temp path in the same directory as the WAL file.
+    //    Using the same directory is essential for atomic rename (same device).
+    // -------------------------------------------------------------------------
+    const std::filesystem::path wal_path(path_);
+    const std::filesystem::path dir = wal_path.parent_path().empty()
+                                      ? std::filesystem::path(".")
+                                      : wal_path.parent_path();
+    const std::filesystem::path tmp_path =
+        dir / (wal_path.filename().string() + ".compact.tmp");
+    const std::string tmp_str = tmp_path.string();
+
+    // -------------------------------------------------------------------------
+    // 2. Write all records to the temp file.
+    //    On any failure: remove temp, throw — original WAL is untouched.
+    // -------------------------------------------------------------------------
+    {
+        std::ofstream tmp(tmp_str, std::ios::binary | std::ios::trunc);
+        if (!tmp.is_open()) {
+            throw std::runtime_error(
+                "WAL::rewrite: failed to create temporary file: " + tmp_str);
+        }
+
+        // Write one SET record per live key.
+        // We build each record by temporarily redirecting stream_ to tmp,
+        // but it is cleaner and safer to build the binary blob directly
+        // via a local helper that reuses the existing write_record() logic
+        // through a separate ofstream.
+        //
+        // We replicate the write_record logic inline here using the local
+        // temp ofstream to avoid swapping stream_ prematurely.
+
+        for (const auto& [key, value] : snapshot) {
+            // Replicate write_record() — same binary layout, same CRC32 —
+            // but targeting tmp instead of stream_.
+
+            if (key.size() > static_cast<std::size_t>(
+                    std::numeric_limits<std::uint32_t>::max())) {
+                // Clean up and throw.
+                tmp.close();
+                std::error_code ec;
+                std::filesystem::remove(tmp_path, ec);
+                throw std::runtime_error("WAL::rewrite: key too large to encode");
+            }
+            if (value.size() > static_cast<std::size_t>(
+                    std::numeric_limits<std::uint32_t>::max())) {
+                tmp.close();
+                std::error_code ec;
+                std::filesystem::remove(tmp_path, ec);
+                throw std::runtime_error("WAL::rewrite: value too large to encode");
+            }
+
+            const auto key_len = static_cast<std::uint32_t>(key.size());
+            const auto val_len = static_cast<std::uint32_t>(value.size());
+
+            std::vector<std::uint8_t> body;
+            body.reserve(kWalHeaderSize + key_len + val_len);
+
+            encode_u32(body, kWalMagic);
+            encode_u8 (body, kWalVersion);
+            encode_u8 (body, kOpSet);
+            encode_u32(body, key_len);
+            encode_u32(body, val_len);
+
+            for (const char c : key)   { body.push_back(static_cast<std::uint8_t>(c)); }
+            for (const char c : value) { body.push_back(static_cast<std::uint8_t>(c)); }
+
+            const std::uint32_t checksum = crc32(body.data(), body.size());
+            encode_u32(body, checksum);
+
+            tmp.write(reinterpret_cast<const char*>(body.data()),
+                      static_cast<std::streamsize>(body.size()));
+            tmp.flush();
+
+            if (tmp.fail()) {
+                tmp.close();
+                std::error_code ec;
+                std::filesystem::remove(tmp_path, ec);
+                throw std::runtime_error(
+                    "WAL::rewrite: write failed for key: " + key);
+            }
+        }
+        // tmp goes out of scope here → destructor closes and flushes.
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Atomically replace the original WAL with the temp file.
+    //    std::filesystem::rename() is atomic on POSIX (same device).
+    //    On failure, remove the temp file and leave the original intact.
+    // -------------------------------------------------------------------------
+    {
+        std::error_code ec;
+        std::filesystem::rename(tmp_path, wal_path, ec);
+        if (ec) {
+            // Rename failed — clean up temp, preserve original.
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp_path, rm_ec);
+            throw std::runtime_error(
+                "WAL::rewrite: atomic rename failed: " + ec.message());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Reopen stream_ on the new WAL file (same path, new inode).
+    //    This is critical: without this, stream_ still refers to the old
+    //    inode and future appends would go to the replaced (now deleted) file.
+    // -------------------------------------------------------------------------
+    stream_.close();
+    stream_.open(path_, std::ios::binary | std::ios::app);
+    if (!stream_.is_open()) {
+        // The compacted WAL is on disk at path_, but we cannot append to it.
+        // This is a fatal state — callers should not continue using this WAL.
+        throw std::runtime_error(
+            "WAL::rewrite: compaction succeeded but failed to reopen WAL "
+            "stream at: " + path_);
+    }
 }
 
 } // namespace forgekv
