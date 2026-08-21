@@ -1,6 +1,6 @@
 #pragma once
 // =============================================================================
-// ForgeKV — Stage 5: KeyValueStore (Crash Recovery / WAL Replay)
+// ForgeKV — Stage 7: KeyValueStore (Concurrency / Thread Safety)
 // =============================================================================
 //
 // KeyValueStore is the public-facing engine of ForgeKV. It maps string keys to
@@ -21,10 +21,36 @@
 //          shutdown.  All three constructors perform recovery automatically.
 //          Recovery does NOT write new WAL records.  After recovery, normal
 //          mutations continue appending to the existing WAL.
+// Stage 7: KeyValueStore is now thread-safe via a std::shared_mutex (mutex_).
 //
-// Architecture (Stage 5):
+//          Locking model:
 //
-//                   KeyValueStore
+//          READ operations (get, exists, size, empty):
+//            Acquire std::shared_lock<std::shared_mutex> — multiple readers
+//            may hold the lock simultaneously.
+//
+//          WRITE operations (set, del, clear):
+//            Acquire std::unique_lock<std::shared_mutex> — exactly one writer
+//            holds the lock; all readers and other writers are excluded.
+//
+//          The mutex_ is acquired for the FULL duration of each public
+//          operation (both the WAL write and the storage mutation), so that
+//          a write is atomic from the perspective of other threads. There is
+//          no intermediate visible state where the WAL has been written but
+//          the in-memory store has not yet been updated.
+//
+//          InMemoryStorage does NOT have its own mutex. All access to
+//          storage_ is mediated through KeyValueStore which already holds the
+//          appropriate lock before calling into it.
+//
+//          WAL is likewise not independently synchronized. The WAL's
+//          ofstream is only written under the exclusive lock held by the
+//          write operations, so no two concurrent writers can interleave
+//          WAL records.
+//
+// Architecture (Stage 7):
+//
+//                   KeyValueStore  ← public thread-safe boundary
 //                  /     |       \
 //                 /      |        \
 //                v       v         v
@@ -38,17 +64,18 @@
 //   1. Construct Storage (empty).
 //   2. Open WAL (append mode — existing content preserved).
 //   3. Recovery::run() replays WAL records into Storage.
-//   4. Store is ready for normal operation.
+//   4. Store is ready for normal, thread-safe operation.
 //
 // Write ordering (unchanged from Stage 4):
 //
-//   KeyValueStore::set()   → WAL::append_set()   → Storage::set()
-//   KeyValueStore::del()   → WAL::append_del()   → Storage::del()
-//   KeyValueStore::clear() → WAL::append_clear() → Storage::clear()
+//   KeyValueStore::set()   → [exclusive lock] → WAL::append_set()   → Storage::set()
+//   KeyValueStore::del()   → [exclusive lock] → WAL::append_del()   → Storage::del()
+//   KeyValueStore::clear() → [exclusive lock] → WAL::append_clear() → Storage::clear()
 //
 // Recovery ordering (does NOT write to WAL):
 //
 //   WAL::replay() → Recovery::run() → Storage::set/del/clear()
+//   (Recovery runs in the constructor, before the store is exposed to threads.)
 //
 // Recovery failure:
 //
@@ -66,7 +93,7 @@
 //   If the WAL file does not exist or is empty, recovery is a no-op.
 //   The store starts with an empty Storage, as before Stage 5.
 //
-// Thread safety: NOT thread-safe at this stage. Stage 7 adds synchronization.
+// Thread safety: THREAD-SAFE as of Stage 7 via std::shared_mutex.
 // =============================================================================
 
 #include "forgekv/recovery.h"
@@ -75,6 +102,7 @@
 
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 
 namespace forgekv {
@@ -106,12 +134,18 @@ public:
 
     ~KeyValueStore() = default;
 
-    // Not copyable. Move is allowed.
+    // Not copyable. Movable via custom move constructor.
+    //
+    // std::shared_mutex is non-movable, so the default-generated move
+    // constructor is deleted by the compiler. We provide an explicit move
+    // constructor that moves storage_ and wal_ and default-constructs a new
+    // mutex_ for the moved-to object (the moved-from mutex state is irrelevant
+    // because the moved-from store must not be used after a move).
     KeyValueStore(const KeyValueStore&)            = delete;
     KeyValueStore& operator=(const KeyValueStore&) = delete;
 
-    KeyValueStore(KeyValueStore&&)            = default;
-    KeyValueStore& operator=(KeyValueStore&&) = default;
+    KeyValueStore(KeyValueStore&& other) noexcept;
+    KeyValueStore& operator=(KeyValueStore&&) = delete;
 
     // -------------------------------------------------------------------------
     // Core operations
@@ -165,6 +199,18 @@ private:
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
+
+    // Reader/writer lock protecting storage_ and wal_ from concurrent access.
+    //
+    // Ownership model:
+    //   - Read operations (get, exists, size, empty) acquire a shared_lock,
+    //     allowing multiple concurrent readers.
+    //   - Write operations (set, del, clear) acquire a unique_lock, granting
+    //     exclusive access for the full duration of WAL write + storage mutation.
+    //
+    // mutex_ is declared mutable so that const read operations (get, exists,
+    // size, empty) can acquire a shared_lock without violating const-ness.
+    mutable std::shared_mutex mutex_;
 
     // Backing storage — owned exclusively. Never null after construction.
     std::unique_ptr<Storage> storage_;

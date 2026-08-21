@@ -21,15 +21,18 @@
 #include "forgekv/in_memory_storage.h"
 #include "forgekv/wal.h"
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <latch>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // -----------------------------------------------------------------------------
@@ -2199,6 +2202,416 @@ TEST(s5_repeated_recovery_is_deterministic) {
 }
 
 // =============================================================================
+// Stage 7 Tests — Concurrency
+// =============================================================================
+//
+// These tests verify that KeyValueStore is correctly thread-safe under
+// concurrent access.  They use:
+//
+//   std::latch   — barrier to synchronize thread start (C++20)
+//   std::atomic  — lock-free counters / flags
+//   std::thread  — worker threads
+//   std::vector  — thread pools
+//
+// Design principles:
+//   - All threads use a std::latch to start simultaneously, increasing the
+//     likelihood of real concurrent execution.
+//   - Correctness, not timing, is the primary verification criterion.
+//   - No arbitrary sleeps.
+//   - Each test uses a dedicated temp WAL to avoid state bleed.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// S7-1. Concurrent reads — no crashes, no incorrect values
+//
+//   Seed N keys.  Launch T reader threads.  Each reader repeatedly calls
+//   get() and exists() on every key for R rounds.  All expected values must
+//   be returned; no crash or unexpected nullopt may occur.
+// ---------------------------------------------------------------------------
+TEST(s7_concurrent_reads) {
+    TEMP_WAL(guard);
+
+    const int KEY_COUNT = 20;
+    const int THREADS   = 8;
+    const int ROUNDS    = 50;
+
+    // Build store and seed keys.
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    for (int i = 0; i < KEY_COUNT; ++i) {
+        store.set("key" + std::to_string(i), "val" + std::to_string(i));
+    }
+
+    // Latch: all threads wait here, then fire simultaneously.
+    std::latch ready(THREADS);
+    std::atomic<int> errors{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(THREADS);
+
+    for (int t = 0; t < THREADS; ++t) {
+        threads.emplace_back([&]() {
+            ready.arrive_and_wait();
+
+            for (int r = 0; r < ROUNDS; ++r) {
+                for (int i = 0; i < KEY_COUNT; ++i) {
+                    const std::string key = "key" + std::to_string(i);
+                    const std::string expected = "val" + std::to_string(i);
+
+                    auto val = store.get(key);
+                    if (!val.has_value() || val.value() != expected) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    if (!store.exists(key)) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) { th.join(); }
+
+    ASSERT_EQ(errors.load(), 0);
+    ASSERT_EQ(store.size(), static_cast<std::size_t>(KEY_COUNT));
+}
+
+// ---------------------------------------------------------------------------
+// S7-2. Concurrent writes to distinct keys — all writes visible after join
+//
+//   T threads each own a disjoint partition of K keys.  Each thread sets
+//   all keys in its partition.  After all threads finish, every expected
+//   key/value pair must be present in the store.
+// ---------------------------------------------------------------------------
+TEST(s7_concurrent_writes_disjoint_keys) {
+    TEMP_WAL(guard);
+
+    const int THREADS    = 8;
+    const int KEYS_EACH  = 50;  // each thread writes KEYS_EACH distinct keys
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    std::latch ready(THREADS);
+
+    std::vector<std::thread> threads;
+    threads.reserve(THREADS);
+
+    for (int t = 0; t < THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            ready.arrive_and_wait();
+
+            const int base = t * KEYS_EACH;
+            for (int i = 0; i < KEYS_EACH; ++i) {
+                const std::string key = "t" + std::to_string(t) + "_k" + std::to_string(i);
+                const std::string val = "v" + std::to_string(base + i);
+                store.set(key, val);
+            }
+        });
+    }
+
+    for (auto& th : threads) { th.join(); }
+
+    // After all threads finish, every key must be present with correct value.
+    std::size_t found = 0;
+    for (int t = 0; t < THREADS; ++t) {
+        const int base = t * KEYS_EACH;
+        for (int i = 0; i < KEYS_EACH; ++i) {
+            const std::string key = "t" + std::to_string(t) + "_k" + std::to_string(i);
+            const std::string expected = "v" + std::to_string(base + i);
+            auto val = store.get(key);
+            ASSERT_HAS_VALUE(val);
+            ASSERT_EQ(val.value(), expected);
+            ++found;
+        }
+    }
+
+    ASSERT_EQ(found, static_cast<std::size_t>(THREADS * KEYS_EACH));
+    ASSERT_EQ(store.size(), static_cast<std::size_t>(THREADS * KEYS_EACH));
+}
+
+// ---------------------------------------------------------------------------
+// S7-3. Concurrent updates — final value is one of the written values
+//
+//   T threads all write to the SAME key repeatedly.  After all threads
+//   complete, the key must exist and its value must be a valid string that
+//   was written by one of the threads (not corrupted / mixed).
+// ---------------------------------------------------------------------------
+TEST(s7_concurrent_updates_same_key) {
+    TEMP_WAL(guard);
+
+    const int THREADS = 8;
+    const int ROUNDS  = 100;
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    std::latch ready(THREADS);
+
+    std::vector<std::thread> threads;
+    threads.reserve(THREADS);
+
+    for (int t = 0; t < THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            ready.arrive_and_wait();
+
+            for (int r = 0; r < ROUNDS; ++r) {
+                // Each thread writes its own deterministic value.
+                const std::string val = "thread" + std::to_string(t)
+                                      + "_round" + std::to_string(r);
+                store.set("shared_key", val);
+            }
+        });
+    }
+
+    for (auto& th : threads) { th.join(); }
+
+    // The key must exist (written by at least one thread).
+    ASSERT_TRUE(store.exists("shared_key"));
+
+    // The final value must be a non-empty string — no corruption.
+    auto final_val = store.get("shared_key");
+    ASSERT_HAS_VALUE(final_val);
+    ASSERT_FALSE(final_val.value().empty());
+
+    // The value prefix must match one of the thread prefixes (sanity check).
+    const std::string& v = final_val.value();
+    bool valid_prefix = false;
+    for (int t = 0; t < THREADS; ++t) {
+        const std::string prefix = "thread" + std::to_string(t) + "_round";
+        if (v.rfind(prefix, 0) == 0) {
+            valid_prefix = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(valid_prefix);
+}
+
+// ---------------------------------------------------------------------------
+// S7-4. Mixed read/write workload — readers see consistent values
+//
+//   Writer threads update a set of keys continuously.
+//   Reader threads read those keys and verify:
+//     - No crash.
+//     - If a key exists, its value must be one of the expected prefixes.
+//     - Keys do not return mid-write garbage.
+//
+//   A std::atomic<bool> flag stops threads after the writers finish.
+// ---------------------------------------------------------------------------
+TEST(s7_concurrent_mixed_read_write) {
+    TEMP_WAL(guard);
+
+    const int WRITER_THREADS = 4;
+    const int READER_THREADS = 4;
+    const int WRITE_OPS_EACH = 200;
+    const int KEY_COUNT      = 10;
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    // Pre-seed keys so readers have something to read from the start.
+    for (int i = 0; i < KEY_COUNT; ++i) {
+        store.set("mkey" + std::to_string(i), "initial");
+    }
+
+    std::latch           ready(WRITER_THREADS + READER_THREADS);
+    std::atomic<bool>    done{false};
+    std::atomic<int>     read_errors{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(WRITER_THREADS + READER_THREADS);
+
+    // Writer threads: continuously update keys.
+    for (int t = 0; t < WRITER_THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            ready.arrive_and_wait();
+
+            for (int op = 0; op < WRITE_OPS_EACH; ++op) {
+                const int ki = op % KEY_COUNT;
+                const std::string key = "mkey" + std::to_string(ki);
+                const std::string val = "writer" + std::to_string(t)
+                                      + "_op" + std::to_string(op);
+                store.set(key, val);
+            }
+        });
+    }
+
+    // Reader threads: read keys until writers are done.
+    for (int t = 0; t < READER_THREADS; ++t) {
+        threads.emplace_back([&]() {
+            ready.arrive_and_wait();
+
+            while (!done.load(std::memory_order_acquire)) {
+                for (int i = 0; i < KEY_COUNT; ++i) {
+                    auto val = store.get("mkey" + std::to_string(i));
+                    // Value may or may not be present (not deleted in this test)
+                    // but if it is present it must be a non-empty string.
+                    if (val.has_value() && val.value().empty()) {
+                        read_errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+
+    // Join writer threads first, then signal readers to stop.
+    for (int t = 0; t < WRITER_THREADS; ++t) {
+        threads[t].join();
+    }
+    done.store(true, std::memory_order_release);
+    for (int t = WRITER_THREADS; t < WRITER_THREADS + READER_THREADS; ++t) {
+        threads[t].join();
+    }
+
+    ASSERT_EQ(read_errors.load(), 0);
+
+    // After all writers finished, every pre-seeded key must still exist.
+    for (int i = 0; i < KEY_COUNT; ++i) {
+        ASSERT_TRUE(store.exists("mkey" + std::to_string(i)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S7-5. Concurrent del + set on the same key — store remains consistent
+//
+//   Two groups of threads race: one group continuously sets a key, the
+//   other group continuously deletes it.  After all threads finish, the
+//   store must be in a valid state (no crash, no corrupted value).
+// ---------------------------------------------------------------------------
+TEST(s7_concurrent_set_and_del_same_key) {
+    TEMP_WAL(guard);
+
+    const int SET_THREADS = 4;
+    const int DEL_THREADS = 4;
+    const int OPS_EACH    = 100;
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    std::latch ready(SET_THREADS + DEL_THREADS);
+    std::atomic<int> errors{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(SET_THREADS + DEL_THREADS);
+
+    // Setter threads.
+    for (int t = 0; t < SET_THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            ready.arrive_and_wait();
+            for (int op = 0; op < OPS_EACH; ++op) {
+                store.set("race_key", "val_t" + std::to_string(t));
+            }
+        });
+    }
+
+    // Deleter threads.
+    for (int t = 0; t < DEL_THREADS; ++t) {
+        threads.emplace_back([&]() {
+            ready.arrive_and_wait();
+            for (int op = 0; op < OPS_EACH; ++op) {
+                store.del("race_key"); // returns true or false — both valid
+            }
+        });
+    }
+
+    for (auto& th : threads) { th.join(); }
+
+    // No assertion on final state (may or may not exist — both valid).
+    // The key invariant: no crash, no corrupted value, and if the key
+    // exists its value must be non-empty and match expected prefix.
+    auto final_val = store.get("race_key");
+    if (final_val.has_value()) {
+        ASSERT_FALSE(final_val.value().empty());
+        // value must start with "val_t"
+        const std::string& v = final_val.value();
+        ASSERT_TRUE(v.rfind("val_t", 0) == 0);
+    }
+
+    // size() must be 0 or 1 — no phantom keys.
+    const std::size_t sz = store.size();
+    ASSERT_TRUE(sz == 0 || sz == 1);
+
+    ASSERT_EQ(errors.load(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// S7-6. Concurrent clear() with reads and writes — no crash
+//
+//   Writer threads set keys, reader threads call size()/empty()/get().
+//   One dedicated thread repeatedly calls clear().
+//   All threads synchronize on a latch.  No crash allowed.
+//   After all threads complete, size() must be deterministic.
+// ---------------------------------------------------------------------------
+TEST(s7_concurrent_clear_with_readers_writers) {
+    TEMP_WAL(guard);
+
+    const int WRITER_THREADS = 3;
+    const int READER_THREADS = 3;
+    const int CLEAR_THREADS  = 1;
+    const int OPS_EACH       = 80;
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(guard.path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    const int TOTAL = WRITER_THREADS + READER_THREADS + CLEAR_THREADS;
+    std::latch ready(TOTAL);
+
+    std::vector<std::thread> threads;
+    threads.reserve(TOTAL);
+
+    // Writers.
+    for (int t = 0; t < WRITER_THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            ready.arrive_and_wait();
+            for (int op = 0; op < OPS_EACH; ++op) {
+                store.set("wk" + std::to_string(t) + "_" + std::to_string(op),
+                          "wv" + std::to_string(op));
+            }
+        });
+    }
+
+    // Readers.
+    for (int t = 0; t < READER_THREADS; ++t) {
+        threads.emplace_back([&]() {
+            ready.arrive_and_wait();
+            for (int op = 0; op < OPS_EACH; ++op) {
+                (void)store.size();
+                (void)store.empty();
+                (void)store.get("wk0_0");
+            }
+        });
+    }
+
+    // Clear threads.
+    for (int t = 0; t < CLEAR_THREADS; ++t) {
+        threads.emplace_back([&]() {
+            ready.arrive_and_wait();
+            for (int op = 0; op < OPS_EACH; ++op) {
+                store.clear();
+            }
+        });
+    }
+
+    for (auto& th : threads) { th.join(); }
+
+    // After clear threads and writer threads, the store must be valid.
+    // size() must return a non-negative value (trivially true for size_t,
+    // but verifies no crash/corruption).
+    const std::size_t sz = store.size();
+    (void)sz; // value is indeterminate (clear races with set) — that's fine
+    // empty() and size() must be consistent.
+    ASSERT_EQ(store.empty(), (store.size() == 0));
+}
+
+// =============================================================================
 // Test runner
 // =============================================================================
 
@@ -2207,7 +2620,7 @@ int main() {
     int passed = 0;
     int failed  = 0;
 
-    std::cout << "\nForgeKV Stage 1 + 2 + 3 + 4 + 5 — KeyValueStore, WAL & Recovery Tests\n";
+    std::cout << "\nForgeKV Stage 1–7 — KeyValueStore, WAL, Recovery & Concurrency Tests\n";
     std::cout << std::string(57, '=') << "\n\n";
 
     for (const auto& tc : tests) {

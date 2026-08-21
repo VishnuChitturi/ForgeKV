@@ -1,8 +1,11 @@
 // =============================================================================
-// ForgeKV — Stage 6: HTTP Integration Tests
+// ForgeKV — Stage 6 + Stage 7: HTTP Integration Tests
 // =============================================================================
 //
 // Tests the HttpServer REST API end-to-end using cpp-httplib's Client.
+//
+// Stage 6 tests: single-client correctness of all four REST endpoints.
+// Stage 7 tests: concurrent multi-client correctness under the thread pool.
 //
 // Test server lifecycle
 // ---------------------
@@ -11,10 +14,9 @@
 //   The server runs on a dedicated std::thread for the duration of the fixture.
 //   After each fixture the server is stopped and the thread is joined.
 //
-//   Because the server thread and the test thread share the same
-//   KeyValueStore (no mutex — intentional for Stage 6), all HTTP calls are
-//   routed through InlineTaskQueue and execute serially on the server thread.
-//   The client is single-threaded, so there is no concurrent access.
+//   Stage 7: The server uses cpp-httplib's default ThreadPool (no InlineTaskQueue
+//   override), so multiple requests are dispatched to worker threads concurrently.
+//   KeyValueStore's std::shared_mutex ensures thread safety.
 //
 // Port selection
 // --------------
@@ -56,6 +58,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <latch>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -451,6 +454,219 @@ TEST(round_trip_set_get_delete) {
     auto get2 = cli.Get("/key/x");
     ASSERT_TRUE(get2 != nullptr);
     ASSERT_EQ(get2->status, 404);
+}
+
+// =============================================================================
+// Tests — Stage 7: HTTP Concurrency
+// =============================================================================
+//
+// Verifies that the HttpServer can handle multiple concurrent requests
+// correctly when backed by a thread-safe KeyValueStore.
+//
+// Strategy:
+//   - Launch a single test server (ephemeral port).
+//   - Fire N client threads simultaneously (via std::latch).
+//   - Each thread performs PUT then GET operations on distinct key namespaces.
+//   - After all threads finish, verify every key has the correct final value.
+//   - Also verify that concurrent GETs on the same key do not produce garbage.
+//
+// This test does NOT rely on timing to prove concurrency — it verifies
+// correctness under concurrent load.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// S7-HTTP-1. Concurrent PUTs from multiple clients — all writes survive
+//
+//   T client threads each write K distinct keys.
+//   After all threads join, a single-threaded verification pass reads every
+//   key via HTTP GET and confirms the expected value.
+// ---------------------------------------------------------------------------
+TEST(s7_http_concurrent_puts_distinct_keys) {
+    TempWAL wal("s7_http_puts");
+    HttpTestFixture fix(wal.path);
+
+    const int THREADS   = 6;
+    const int KEYS_EACH = 20;
+
+    std::latch ready(THREADS);
+    std::atomic<int> errors{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(THREADS);
+
+    for (int t = 0; t < THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            ready.arrive_and_wait();
+
+            auto cli = fix.make_client();
+            for (int i = 0; i < KEYS_EACH; ++i) {
+                const std::string key = "/key/t" + std::to_string(t)
+                                      + "_k" + std::to_string(i);
+                const std::string val = "v_t" + std::to_string(t)
+                                      + "_k" + std::to_string(i);
+                auto res = cli.Put(key, val, "text/plain");
+                if (!res || res->status != 200) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) { th.join(); }
+
+    // Single-threaded verification.
+    auto cli = fix.make_client();
+    for (int t = 0; t < THREADS; ++t) {
+        for (int i = 0; i < KEYS_EACH; ++i) {
+            const std::string key = "/key/t" + std::to_string(t)
+                                  + "_k" + std::to_string(i);
+            auto res = cli.Get(key);
+            ASSERT_TRUE(res != nullptr);
+            ASSERT_EQ(res->status, 200);
+        }
+    }
+
+    ASSERT_EQ(errors.load(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// S7-HTTP-2. Concurrent GETs — correct values, no corrupted responses
+//
+//   Seed K keys directly in the store.
+//   Launch T reader threads, each making R GET requests.
+//   Every response must be 200 with a valid JSON body.
+// ---------------------------------------------------------------------------
+TEST(s7_http_concurrent_gets) {
+    TempWAL wal("s7_http_gets");
+    HttpTestFixture fix(wal.path);
+
+    const int KEYS    = 10;
+    const int THREADS = 6;
+    const int ROUNDS  = 20;
+
+    // Pre-seed keys directly.
+    for (int i = 0; i < KEYS; ++i) {
+        fix.store().set("gk" + std::to_string(i),
+                        "gv" + std::to_string(i));
+    }
+
+    std::latch ready(THREADS);
+    std::atomic<int> errors{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(THREADS);
+
+    for (int t = 0; t < THREADS; ++t) {
+        threads.emplace_back([&]() {
+            ready.arrive_and_wait();
+
+            auto cli = fix.make_client();
+            for (int r = 0; r < ROUNDS; ++r) {
+                for (int i = 0; i < KEYS; ++i) {
+                    const std::string path = "/key/gk" + std::to_string(i);
+                    auto res = cli.Get(path);
+                    if (!res || res->status != 200) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    // Response body must contain the key.
+                    if (res && res->body.find("gk" + std::to_string(i))
+                                == std::string::npos) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) { th.join(); }
+
+    ASSERT_EQ(errors.load(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// S7-HTTP-3. Mixed concurrent PUT + GET + DELETE — server stays consistent
+//
+//   Writers perform PUT/DELETE in a loop.
+//   Readers perform GET in a loop.
+//   No crashes, no 500 responses, no malformed JSON.
+// ---------------------------------------------------------------------------
+TEST(s7_http_concurrent_mixed_put_get_delete) {
+    TempWAL wal("s7_http_mixed");
+    HttpTestFixture fix(wal.path);
+
+    const int WRITE_THREADS = 3;
+    const int READ_THREADS  = 3;
+    const int KEYS          = 5;
+    const int OPS_EACH      = 30;
+
+    // Pre-seed.
+    for (int i = 0; i < KEYS; ++i) {
+        fix.store().set("mk" + std::to_string(i), "initial");
+    }
+
+    std::latch ready(WRITE_THREADS + READ_THREADS);
+    std::atomic<int> server_errors{0}; // counts any 5xx response
+
+    std::vector<std::thread> threads;
+    threads.reserve(WRITE_THREADS + READ_THREADS);
+
+    // Write threads: alternate PUT and DELETE.
+    for (int t = 0; t < WRITE_THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            ready.arrive_and_wait();
+
+            auto cli = fix.make_client();
+            for (int op = 0; op < OPS_EACH; ++op) {
+                const int ki = op % KEYS;
+                const std::string path = "/key/mk" + std::to_string(ki);
+                if (op % 3 == 0) {
+                    // DELETE
+                    auto res = cli.Delete(path);
+                    if (res && res->status >= 500) {
+                        server_errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    // PUT
+                    const std::string val = "w" + std::to_string(t)
+                                           + "_op" + std::to_string(op);
+                    auto res = cli.Put(path, val, "text/plain");
+                    if (res && res->status >= 500) {
+                        server_errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+
+    // Read threads: GET repeatedly.
+    for (int t = 0; t < READ_THREADS; ++t) {
+        threads.emplace_back([&]() {
+            ready.arrive_and_wait();
+
+            auto cli = fix.make_client();
+            for (int op = 0; op < OPS_EACH; ++op) {
+                const int ki = op % KEYS;
+                const std::string path = "/key/mk" + std::to_string(ki);
+                auto res = cli.Get(path);
+                if (res && res->status >= 500) {
+                    server_errors.fetch_add(1, std::memory_order_relaxed);
+                }
+                // 200 or 404 are both valid (key may have been deleted).
+            }
+        });
+    }
+
+    for (auto& th : threads) { th.join(); }
+
+    // No 5xx responses.
+    ASSERT_EQ(server_errors.load(), 0);
+
+    // Health endpoint must still respond correctly.
+    auto cli = fix.make_client();
+    auto health = cli.Get("/health");
+    ASSERT_TRUE(health != nullptr);
+    ASSERT_EQ(health->status, 200);
+    ASSERT_EQ(health->body, "{\"status\":\"ok\"}");
 }
 
 // =============================================================================

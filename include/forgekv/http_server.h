@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// ForgeKV — Stage 6: HttpServer
+// ForgeKV — Stage 7: HttpServer (Concurrent Request Handling)
 // =============================================================================
 //
 // HttpServer is a thin HTTP translation layer on top of the ForgeKV engine.
@@ -13,18 +13,18 @@
 //
 // Architecture:
 //
-//   HTTP Client
+//   HTTP Client(s)
 //       │
 //       ▼
-//   HttpServer          ← this class (Stage 6)
+//   HttpServer          ← this class (Stage 6 API, Stage 7 concurrency)
 //       │
 //       ▼
-//   KeyValueStore       ← unchanged from Stage 5
+//   KeyValueStore       ← thread-safe as of Stage 7 (shared_mutex)
 //       │
 //       ▼
 //   WAL + InMemoryStorage
 //
-// REST API (Stage 6):
+// REST API (unchanged from Stage 6):
 //
 //   GET    /key/<key>   → 200 {"key":"...","value":"..."}
 //                         404 {"error":"key not found"}
@@ -37,15 +37,19 @@
 //
 //   GET    /health      → 200 {"status":"ok"}
 //
-// Single-threaded operation:
+// Concurrent operation (Stage 7):
 //
-//   cpp-httplib defaults to a thread pool with one thread per connection.
-//   Stage 6 overrides new_task_queue with an InlineTaskQueue that executes
-//   every request handler directly on the accept loop's thread — no worker
-//   threads are created, all requests are processed serially.
+//   Stage 6 used an InlineTaskQueue that ran every request handler directly
+//   on the accept-loop thread, making the server fully single-threaded.
 //
-//   Thread safety is NOT provided at this stage. Stage 7 adds a
-//   std::shared_mutex to KeyValueStore and removes this constraint.
+//   Stage 7 removes that constraint. The server now uses cpp-httplib's
+//   default ThreadPool task queue. Each incoming connection is dispatched to
+//   a worker thread from the pool, allowing multiple requests to be handled
+//   concurrently.
+//
+//   Thread safety is guaranteed by KeyValueStore's std::shared_mutex:
+//     - Concurrent GET/health requests acquire shared locks (readers).
+//     - Concurrent PUT/DELETE requests acquire exclusive locks (writers).
 //
 // JSON serialization:
 //
@@ -56,17 +60,14 @@
 // HTTP library:
 //
 //   cpp-httplib v0.18.5, vendored at third_party/httplib/httplib.h.
-//   MIT license. Single-header, no HTTPS/OpenSSL required for Stage 6.
+//   MIT license. Single-header, no HTTPS/OpenSSL required.
 //
-// Thread safety: NOT thread-safe at Stage 6. Stage 7 adds synchronization.
+// Thread safety: THREAD-SAFE as of Stage 7 (via KeyValueStore's shared_mutex).
 // =============================================================================
 
 #include "forgekv/kv_store.h"
 
 // cpp-httplib — vendored single-header library
-// CPPHTTPLIB_NO_EXCEPTIONS: forward errors as status codes, not C++ exceptions.
-// We do not define it here; let the default behavior stand so that httplib
-// itself remains stable. Our own handlers catch std::exception explicitly.
 #include "httplib.h"
 
 #include <string>
@@ -87,9 +88,8 @@ public:
     // The store must outlive the HttpServer.
     //
     // On construction:
-    //   1. The underlying httplib::Server is configured for single-threaded
-    //      operation (InlineTaskQueue — see below).
-    //   2. All route handlers are registered.
+    //   1. All route handlers are registered.
+    //   2. cpp-httplib's default ThreadPool task queue is used — no override.
     //   3. The server is NOT yet listening — call listen() to start.
     explicit HttpServer(KeyValueStore& store);
 
@@ -145,35 +145,6 @@ public:
     void stop();
 
 private:
-    // -------------------------------------------------------------------------
-    // Single-threaded task queue (InlineTaskQueue)
-    // -------------------------------------------------------------------------
-    //
-    // cpp-httplib dispatches each accepted connection to a TaskQueue.
-    // The default is ThreadPool, which creates worker threads.
-    //
-    // InlineTaskQueue overrides enqueue() to execute the task directly on the
-    // calling thread (the accept loop), making the server fully single-threaded.
-    // No worker threads are created or joined.
-    //
-    // This is Stage 6 behaviour. Stage 7 will replace this with the default
-    // ThreadPool (or a custom pool) once KeyValueStore is thread-safe.
-
-    class InlineTaskQueue final : public httplib::TaskQueue {
-    public:
-        InlineTaskQueue()  = default;
-        ~InlineTaskQueue() override = default;
-
-        // Execute fn() immediately on the calling thread.
-        bool enqueue(std::function<void()> fn) override {
-            fn();
-            return true;
-        }
-
-        // Nothing to shut down — there are no worker threads.
-        void shutdown() override {}
-    };
-
     // -------------------------------------------------------------------------
     // Route registration
     // -------------------------------------------------------------------------

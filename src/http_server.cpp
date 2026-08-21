@@ -1,26 +1,31 @@
 // =============================================================================
-// ForgeKV — Stage 6: HttpServer implementation
+// ForgeKV — Stage 7: HttpServer implementation (Concurrent Request Handling)
 // =============================================================================
 //
 // See include/forgekv/http_server.h for the full design and API documentation.
 //
 // This file implements:
 //
-//   1. HttpServer constructor — installs InlineTaskQueue, calls register_routes().
-//   2. listen() / stop() / bound_port() — thin wrappers around httplib::Server.
+//   1. HttpServer constructor — calls register_routes(). No InlineTaskQueue.
+//   2. listen() / stop() / bind_to_any_port() / listen_after_bind() / wait_until_ready()
+//      — thin wrappers around httplib::Server.
 //   3. register_routes() — registers all REST endpoint handlers on server_.
 //   4. json_escape() — correct JSON string escaping.
 //   5. json_status() / json_error() / json_kv() — response serialization helpers.
 //
-// SINGLE-THREADED OPERATION
-// -------------------------
-// server_.new_task_queue is reassigned in the constructor to return an
-// InlineTaskQueue. InlineTaskQueue::enqueue() runs the handler directly on
-// the accept-loop thread instead of dispatching to a worker thread pool.
-// The result is fully sequential, single-threaded request handling.
+// CONCURRENT OPERATION (Stage 7)
+// --------------------------------
+// Stage 6 installed an InlineTaskQueue that ran every request handler
+// synchronously on the accept-loop thread — fully single-threaded.
 //
-// No mutex, no condition variable, no std::thread is introduced here.
-// Stage 7 removes this constraint by making KeyValueStore thread-safe.
+// Stage 7 removes that override entirely. cpp-httplib's default ThreadPool
+// task queue is used, which dispatches each accepted connection to a worker
+// thread. Multiple requests can now execute concurrently.
+//
+// Thread safety for the KeyValueStore is provided by its std::shared_mutex:
+//   - GET /key/:key and GET /health call read-only operations → shared locks.
+//   - PUT /key/:key calls store_.set() → exclusive lock.
+//   - DELETE /key/:key calls store_.del() → exclusive lock.
 //
 // ROUTE STRUCTURE
 // ---------------
@@ -48,8 +53,6 @@
 //   control characters 0x00–0x1F → \uXXXX
 //
 // Keys and values may contain any of these characters.
-// Binary (non-UTF-8) byte sequences are not supported over this HTTP API;
-// the KV engine's internal string semantics are unchanged.
 // =============================================================================
 
 #include "forgekv/http_server.h"
@@ -63,21 +66,15 @@ namespace forgekv {
 // Constructor
 // =============================================================================
 //
-// 1. Store the reference to the KV engine.
-// 2. Replace the default ThreadPool task queue with InlineTaskQueue so that
-//    every request is handled synchronously on the accept thread.
-// 3. Register all route handlers.
+// Store the reference to the KV engine and register all route handlers.
+// No task queue override — cpp-httplib's default ThreadPool is used.
 
 HttpServer::HttpServer(KeyValueStore& store)
     : store_(store)
 {
-    // Override the task queue: return a new InlineTaskQueue on every call.
-    // cpp-httplib calls new_task_queue() once per accept loop iteration and
-    // takes ownership of the returned pointer via std::unique_ptr internally.
-    server_.new_task_queue = []() -> httplib::TaskQueue* {
-        return new InlineTaskQueue{};
-    };
-
+    // Stage 7: Do NOT override new_task_queue. cpp-httplib's default ThreadPool
+    // allows concurrent request handling. KeyValueStore's shared_mutex ensures
+    // thread safety for all store operations.
     register_routes();
 }
 
