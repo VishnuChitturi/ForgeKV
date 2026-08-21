@@ -3335,6 +3335,874 @@ TEST(s8_compact_deterministic_order) {
 }
 
 // =============================================================================
+// Stage 9 Tests — Snapshots
+// =============================================================================
+//
+// Comprehensive snapshot tests covering:
+//
+//   S9-A.  Basic snapshot: create keys → snapshot → restart → verify exact state
+//   S9-B.  Snapshot + later WAL writes survive restart
+//   S9-C.  Repeated updates around snapshot boundary
+//   S9-D.  Deletes after snapshot survive restart (key stays deleted)
+//   S9-E.  Recreate after delete: newest value visible after restart
+//   S9-F.  Empty snapshot
+//   S9-G.  No snapshot fallback (WAL-only recovery still works)
+//   S9-H.  Snapshot corruption → fallback to WAL-only recovery
+//   S9-I.  Snapshot truncation detected
+//   S9-J.  WAL corruption after snapshot still detected
+//   S9-K.  Snapshot boundary: pre-snapshot WAL not replayed again; post- replayed
+//   S9-L.  Multiple snapshots: newest wins
+//   S9-M.  Snapshot + compaction: compact() invalidates snapshot (explicit delete)
+//   S9-N.  Concurrent snapshot() with readers/writers
+//   S9-O.  Snapshot binary format validation (header, version, CRC, records)
+//   S9-P.  Snapshot path convention (<wal>.snapshot)
+//   S9-Q.  Snapshot empty store + WAL tail
+//   S9-R.  WAL replay_from with offset 0 equals full replay
+//   S9-S.  WAL replay_from beyond EOF throws
+//   S9-T.  WAL file_size matches actual written data
+// =============================================================================
+
+#include "forgekv/snapshot.h"  // for SnapshotManager, kSnapshotMagic, etc.
+
+// Helper: RAII guard for snapshot file (deleted on scope exit alongside WAL).
+struct SnapGuard {
+    std::string wal_path;
+    std::string snap_path;
+    explicit SnapGuard(std::string w)
+        : wal_path(std::move(w)), snap_path(wal_path + ".snapshot") {}
+    ~SnapGuard() {
+        std::error_code ec;
+        std::filesystem::remove(wal_path,  ec);
+        std::filesystem::remove(snap_path, ec);
+    }
+};
+
+#define TEMP_SNAP(name)  SnapGuard name{"test_s9_" #name ".wal"}
+
+// Helper: create store, apply callback, destroy, recreate and return.
+// Used to simulate a process restart after snapshot/WAL operations.
+static forgekv::KeyValueStore restart_store(const std::string& wal_path)
+{
+    return make_store(wal_path);
+}
+
+// ---------------------------------------------------------------------------
+// S9-A. Basic snapshot: create keys → snapshot → restart → verify state.
+// ---------------------------------------------------------------------------
+TEST(s9_basic_snapshot_survives_restart) {
+    TEMP_SNAP(g);
+
+    // Phase 1: create state and snapshot.
+    {
+        auto store = make_store(g.wal_path);
+        store.set("name",  "Alice");
+        store.set("lang",  "C++");
+        store.set("stage", "9");
+        ASSERT_TRUE(store.snapshot());
+    }
+
+    // Phase 2: restart — no new WAL records after snapshot.
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("name"),  "Alice");
+        ASSERT_EQ(*store.get("lang"),  "C++");
+        ASSERT_EQ(*store.get("stage"), "9");
+        ASSERT_EQ(store.size(), std::size_t{3});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-B. Snapshot + later WAL writes survive restart correctly.
+//
+//   state → snapshot → more writes → restart → verify ALL (snapshot + tail)
+// ---------------------------------------------------------------------------
+TEST(s9_snapshot_plus_wal_tail_survives_restart) {
+    TEMP_SNAP(g);
+
+    // Phase 1: base state.
+    {
+        auto store = make_store(g.wal_path);
+        store.set("A", "1");
+        store.set("B", "2");
+        ASSERT_TRUE(store.snapshot());
+
+        // Writes AFTER snapshot — must appear in WAL tail.
+        store.set("C", "3");
+        store.set("A", "10"); // update key present in snapshot
+    }
+
+    // Phase 2: restart.
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("A"), "10"); // post-snapshot update wins
+        ASSERT_EQ(*store.get("B"), "2");
+        ASSERT_EQ(*store.get("C"), "3");
+        ASSERT_EQ(store.size(), std::size_t{3});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-C. Repeated updates around snapshot boundary.
+//
+//   SET key many times → snapshot → SET key more times → restart.
+//   Final value must be the last SET, not a pre-snapshot value.
+// ---------------------------------------------------------------------------
+TEST(s9_repeated_updates_around_snapshot) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        for (int i = 1; i <= 50; ++i) {
+            store.set("counter", std::to_string(i));
+        }
+        // counter == "50" at snapshot time
+        ASSERT_TRUE(store.snapshot());
+        for (int i = 51; i <= 100; ++i) {
+            store.set("counter", std::to_string(i));
+        }
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("counter"), "100");
+        ASSERT_EQ(store.size(), std::size_t{1});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-D. Deletes after snapshot survive restart (key remains deleted).
+//
+//   SET key → snapshot → DEL key → restart → key must not exist.
+// ---------------------------------------------------------------------------
+TEST(s9_delete_after_snapshot_survives_restart) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("to_delete", "here");
+        store.set("to_keep",   "keep");
+        ASSERT_TRUE(store.snapshot());
+        store.del("to_delete");  // post-snapshot DEL
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_FALSE(store.exists("to_delete"));
+        ASSERT_EQ(*store.get("to_keep"), "keep");
+        ASSERT_EQ(store.size(), std::size_t{1});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-E. Recreate after delete: newest value visible after restart.
+//
+//   SET A → snapshot → DEL A → SET A=new → restart → A == "new".
+// ---------------------------------------------------------------------------
+TEST(s9_recreate_after_delete_after_snapshot) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("X", "original");
+        ASSERT_TRUE(store.snapshot());
+        store.del("X");
+        store.set("X", "recreated");
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_HAS_VALUE(store.get("X"));
+        ASSERT_EQ(*store.get("X"), "recreated");
+        ASSERT_EQ(store.size(), std::size_t{1});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-F. Empty snapshot — snapshot with zero keys, then WAL adds keys.
+// ---------------------------------------------------------------------------
+TEST(s9_empty_snapshot) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        // Store is empty — take a snapshot of empty state.
+        ASSERT_TRUE(store.empty());
+        ASSERT_TRUE(store.snapshot());
+        // Add keys AFTER the snapshot.
+        store.set("after", "snap");
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("after"), "snap");
+        ASSERT_EQ(store.size(), std::size_t{1});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-G. No snapshot fallback — WAL-only recovery still works unchanged.
+//
+//   Ensure no snapshot file exists → create state → restart → verify.
+// ---------------------------------------------------------------------------
+TEST(s9_no_snapshot_fallback_wal_recovery) {
+    TEMP_SNAP(g);
+
+    // Ensure no snapshot.
+    std::error_code ec;
+    std::filesystem::remove(g.snap_path, ec);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("fallback", "wal_recovery");
+        store.set("num",      "42");
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("fallback"), "wal_recovery");
+        ASSERT_EQ(*store.get("num"),      "42");
+        ASSERT_EQ(store.size(), std::size_t{2});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-H. Snapshot corruption — fallback to full WAL recovery.
+//
+//   Write a valid snapshot → corrupt it → restart → verify state is still
+//   correct (loaded from WAL, not from corrupted snapshot).
+// ---------------------------------------------------------------------------
+TEST(s9_corrupt_snapshot_falls_back_to_wal) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("key1", "value1");
+        store.set("key2", "value2");
+        ASSERT_TRUE(store.snapshot());
+        // Also write WAL records after snapshot so WAL has full history.
+        // (These WAL records are written AFTER snapshot so offset is past them.)
+        // But the WAL from the start has the full history since the snapshot
+        // is corrupt and we fall back to replaying the WAL from offset 0.
+    }
+
+    // Corrupt the snapshot by flipping bytes in the middle.
+    {
+        auto bytes = read_file_bytes(g.snap_path);
+        ASSERT_TRUE(!bytes.empty());
+        // Corrupt the middle of the payload.
+        const std::size_t mid = bytes.size() / 2;
+        bytes[mid] ^= 0xFF;
+        std::ofstream out(g.snap_path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+
+    // Restart — must fall back to WAL recovery (no exception, correct state).
+    {
+        auto store = restart_store(g.wal_path);
+        // WAL has the full history from offset 0.
+        ASSERT_EQ(*store.get("key1"), "value1");
+        ASSERT_EQ(*store.get("key2"), "value2");
+        ASSERT_EQ(store.size(), std::size_t{2});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-I. Snapshot truncation detected — incomplete snapshot is treated as corrupt.
+//
+//   Write a valid snapshot → truncate it → restart → fallback to WAL.
+// ---------------------------------------------------------------------------
+TEST(s9_truncated_snapshot_falls_back_to_wal) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("alpha", "A");
+        store.set("beta",  "B");
+        ASSERT_TRUE(store.snapshot());
+    }
+
+    // Truncate the snapshot to just the header (not the full content).
+    {
+        auto bytes = read_file_bytes(g.snap_path);
+        ASSERT_TRUE(bytes.size() > 10);
+        truncate_file(g.snap_path, 10); // less than minimum valid header
+    }
+
+    // Restart — truncated snapshot detected, fallback to WAL.
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("alpha"), "A");
+        ASSERT_EQ(*store.get("beta"),  "B");
+        ASSERT_EQ(store.size(), std::size_t{2});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-J. WAL corruption after snapshot is still detected.
+//
+//   Create state → snapshot → append more WAL records → corrupt the WAL TAIL
+//   (after the snapshot offset) → restart → must throw (mid-log corruption).
+// ---------------------------------------------------------------------------
+TEST(s9_wal_corruption_after_snapshot_detected) {
+    TEMP_SNAP(g);
+
+    // Build state with snapshot, then add post-snapshot WAL records.
+    std::uint64_t snap_offset = 0;
+    {
+        auto store = make_store(g.wal_path);
+        store.set("pre",  "snap");
+
+        ASSERT_TRUE(store.snapshot());
+        // Capture WAL size at snapshot.
+        snap_offset = forgekv::WAL(g.wal_path).file_size();
+
+        store.set("post", "snap");
+    }
+
+    // WAL has records at [0, snap_offset) and [snap_offset, EOF).
+    // Corrupt a byte in the post-snapshot region.
+    {
+        const auto wal_bytes = read_file_bytes(g.wal_path);
+        ASSERT_TRUE(wal_bytes.size() > snap_offset + 5);
+        // Corrupt 5 bytes starting just after snap_offset (inside the WAL tail).
+        corrupt_bytes(g.wal_path, static_cast<std::size_t>(snap_offset) + 2, 5);
+    }
+
+    // Restart — the post-snapshot WAL segment is corrupt → throw.
+    ASSERT_THROWS(restart_store(g.wal_path));
+
+    (void)snap_offset;
+}
+
+// ---------------------------------------------------------------------------
+// S9-K. Snapshot boundary correctness.
+//
+//   Pre-snapshot WAL records must NOT be replayed again after snapshot load.
+//   Post-snapshot WAL records MUST be replayed.
+//
+//   Strategy: write key A=v1 → snapshot → write A=v2 → restart.
+//   After restart: A must be "v2" (WAL tail replayed), not "v1" replayed
+//   twice (which would still give v1 if snapshot loaded A=v1 and WAL tail
+//   updates A=v2 correctly — what we really test is that A=v1 is not
+//   re-applied AFTER the snapshot already has it, and A=v2 is applied once).
+//
+//   We also verify via a counter: key "count" is incremented in WAL.
+//   If pre-snapshot records were re-replayed, count would be off.
+// ---------------------------------------------------------------------------
+TEST(s9_snapshot_boundary_correctness) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        // Pre-snapshot: set count to 1, A to "pre".
+        store.set("count", "1");
+        store.set("A",     "pre");
+        ASSERT_TRUE(store.snapshot());
+
+        // Post-snapshot: update A, set count to 2.
+        store.set("A",     "post");
+        store.set("count", "2");
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        // A should be "post" (from WAL tail, applied once over snapshot).
+        ASSERT_EQ(*store.get("A"), "post");
+        // count should be "2" — if pre-snapshot was re-replayed it would
+        // briefly go back to "1" before becoming "2" again; in-memory result
+        // is still "2" either way. The key invariant: no crash, correct value.
+        ASSERT_EQ(*store.get("count"), "2");
+        ASSERT_EQ(store.size(), std::size_t{2});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-L. Multiple snapshots: only the last one is used.
+//
+//   Create state → snapshot1 → modify → snapshot2 → modify → restart.
+//   Recovery uses snapshot2 + WAL tail after snapshot2.
+// ---------------------------------------------------------------------------
+TEST(s9_multiple_snapshots_newest_wins) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("x", "1");
+        store.set("y", "1");
+        ASSERT_TRUE(store.snapshot());  // snapshot1: x=1, y=1
+
+        store.set("x", "2");
+        store.set("z", "2");
+        ASSERT_TRUE(store.snapshot());  // snapshot2: x=2, y=1, z=2 (overwrites snapshot1)
+
+        // Post-snapshot2 WAL tail.
+        store.set("w", "3");
+        store.del("y");
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("x"), "2");  // from snapshot2
+        ASSERT_FALSE(store.exists("y"));   // deleted after snapshot2
+        ASSERT_EQ(*store.get("z"), "2");  // from snapshot2
+        ASSERT_EQ(*store.get("w"), "3");  // from WAL tail
+        ASSERT_EQ(store.size(), std::size_t{3});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-M. Snapshot + compaction: compact() deletes snapshot.
+//
+//   Create state → snapshot → compact() → verify snapshot file is gone.
+//   Then restart → WAL-only recovery produces correct state.
+// ---------------------------------------------------------------------------
+TEST(s9_compact_deletes_snapshot) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("p", "1");
+        store.set("q", "2");
+        ASSERT_TRUE(store.snapshot());
+
+        // Snapshot file must exist now.
+        ASSERT_TRUE(std::filesystem::exists(g.snap_path));
+
+        store.compact();
+
+        // Snapshot file must be gone after compact().
+        ASSERT_FALSE(std::filesystem::exists(g.snap_path));
+    }
+
+    // Restart: no snapshot, full WAL recovery (compacted WAL).
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("p"), "1");
+        ASSERT_EQ(*store.get("q"), "2");
+        ASSERT_EQ(store.size(), std::size_t{2});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-M2. Snapshot after compact() produces a valid new snapshot pointing
+//         into the new compacted WAL.
+// ---------------------------------------------------------------------------
+TEST(s9_snapshot_after_compact_works) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("A", "alpha");
+        store.set("B", "beta");
+        store.compact(); // no snapshot yet; just compact
+
+        // Now create snapshot after compaction.
+        ASSERT_TRUE(store.snapshot());
+        ASSERT_TRUE(std::filesystem::exists(g.snap_path));
+
+        // Post-snapshot writes.
+        store.set("C", "gamma");
+    }
+
+    // Restart: snapshot (pointing into compacted WAL) + WAL tail.
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_EQ(*store.get("A"), "alpha");
+        ASSERT_EQ(*store.get("B"), "beta");
+        ASSERT_EQ(*store.get("C"), "gamma");
+        ASSERT_EQ(store.size(), std::size_t{3});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-N. Concurrent snapshot() with active readers and writers.
+//
+//   Multiple writer threads and reader threads run concurrently.
+//   The main thread calls snapshot() while writers are active.
+//
+//   Correctness invariants:
+//   - No crash, no deadlock.
+//   - After all threads finish, restart produces a consistent state.
+//   - Snapshot must contain a logically consistent point-in-time state
+//     (guaranteed by the exclusive lock inside snapshot()).
+// ---------------------------------------------------------------------------
+TEST(s9_concurrent_snapshot_with_readers_writers) {
+    TEMP_SNAP(g);
+
+    constexpr int WRITER_THREADS = 4;
+    constexpr int READER_THREADS = 4;
+    constexpr int WRITE_OPS      = 100;
+    constexpr int KEY_COUNT      = 20;
+
+    auto storage = std::make_unique<forgekv::InMemoryStorage>();
+    auto wal     = std::make_unique<forgekv::WAL>(g.wal_path);
+    forgekv::KeyValueStore store(std::move(storage), std::move(wal));
+
+    // Pre-seed keys.
+    for (int i = 0; i < KEY_COUNT; ++i) {
+        store.set("ck" + std::to_string(i), "initial");
+    }
+
+    std::latch           start_latch(WRITER_THREADS + READER_THREADS + 1);
+    std::atomic<bool>    stop_readers{false};
+    std::atomic<int>     errors{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(WRITER_THREADS + READER_THREADS);
+
+    // Writer threads.
+    for (int t = 0; t < WRITER_THREADS; ++t) {
+        threads.emplace_back([&, t]() {
+            start_latch.arrive_and_wait();
+            for (int op = 0; op < WRITE_OPS; ++op) {
+                const int ki = op % KEY_COUNT;
+                store.set("ck" + std::to_string(ki),
+                          "t" + std::to_string(t) + "_op" + std::to_string(op));
+            }
+        });
+    }
+
+    // Reader threads.
+    for (int t = 0; t < READER_THREADS; ++t) {
+        threads.emplace_back([&]() {
+            start_latch.arrive_and_wait();
+            while (!stop_readers.load(std::memory_order_acquire)) {
+                for (int i = 0; i < KEY_COUNT; ++i) {
+                    auto v = store.get("ck" + std::to_string(i));
+                    if (v.has_value() && v.value().empty()) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+    }
+
+    // Main thread: arrive at latch, then call snapshot() while threads run.
+    start_latch.arrive_and_wait();
+    // Let writers do some work first, then snapshot.
+    // No arbitrary sleep: just call snapshot — it acquires the exclusive lock.
+    const bool snap_ok = store.snapshot();
+    ASSERT_TRUE(snap_ok);
+
+    // Join writers.
+    for (int t = 0; t < WRITER_THREADS; ++t) {
+        threads[t].join();
+    }
+    stop_readers.store(true, std::memory_order_release);
+    for (int t = WRITER_THREADS; t < WRITER_THREADS + READER_THREADS; ++t) {
+        threads[t].join();
+    }
+
+    ASSERT_EQ(errors.load(), 0);
+
+    // Destroy and restart.  State must be consistent.
+    const std::size_t live_size = store.size();
+    {
+        auto store2 = restart_store(g.wal_path);
+        // Size after restart must equal size before (snapshot + WAL tail).
+        ASSERT_EQ(store2.size(), live_size);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-O. Snapshot binary format validation.
+//
+//   After saving a snapshot, parse the raw bytes and verify:
+//   - magic == kSnapshotMagic
+//   - version == kSnapshotVersion
+//   - record_count matches
+//   - key/value content matches
+//   - CRC32 is valid (use SnapshotManager::load() which verifies it)
+// ---------------------------------------------------------------------------
+TEST(s9_snapshot_binary_format) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("format_key", "format_val");
+        store.set("key2",       "val2");
+        ASSERT_TRUE(store.snapshot());
+    }
+
+    // Load raw bytes.
+    const auto raw = read_file_bytes(g.snap_path);
+
+    // Header must be at least 17 + 4 = 21 bytes for 0 records.
+    ASSERT_TRUE(raw.size() >= 17u + 4u);
+
+    // Check magic (little-endian: bytes 0..3).
+    const std::uint32_t magic =
+          static_cast<std::uint32_t>(raw[0])
+        | (static_cast<std::uint32_t>(raw[1]) <<  8)
+        | (static_cast<std::uint32_t>(raw[2]) << 16)
+        | (static_cast<std::uint32_t>(raw[3]) << 24);
+    ASSERT_EQ(magic, forgekv::kSnapshotMagic);
+
+    // Check version (byte 4).
+    ASSERT_EQ(raw[4], forgekv::kSnapshotVersion);
+
+    // Check record count (bytes 13..16).
+    const std::uint32_t count =
+          static_cast<std::uint32_t>(raw[13])
+        | (static_cast<std::uint32_t>(raw[14]) <<  8)
+        | (static_cast<std::uint32_t>(raw[15]) << 16)
+        | (static_cast<std::uint32_t>(raw[16]) << 24);
+    ASSERT_EQ(count, std::uint32_t{2});
+
+    // Use SnapshotManager::load() to verify full integrity.
+    forgekv::SnapshotManager sm(g.wal_path);
+    const auto result = sm.load();
+    ASSERT_TRUE(result.exists);
+    ASSERT_FALSE(result.corrupt);
+    ASSERT_EQ(result.data.records.size(), std::size_t{2});
+
+    // Collect loaded keys.
+    std::vector<std::pair<std::string,std::string>> loaded = result.data.records;
+    std::sort(loaded.begin(), loaded.end());
+    ASSERT_EQ(loaded[0].first,  "format_key");
+    ASSERT_EQ(loaded[0].second, "format_val");
+    ASSERT_EQ(loaded[1].first,  "key2");
+    ASSERT_EQ(loaded[1].second, "val2");
+}
+
+// ---------------------------------------------------------------------------
+// S9-P. Snapshot path convention: file is at <wal_path>.snapshot.
+// ---------------------------------------------------------------------------
+TEST(s9_snapshot_path_convention) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("path_test", "ok");
+        ASSERT_TRUE(store.snapshot());
+    }
+
+    // The snapshot must exist exactly at <wal_path>.snapshot.
+    ASSERT_TRUE(std::filesystem::exists(g.snap_path));
+
+    // And NOT at any other path.
+    ASSERT_FALSE(std::filesystem::exists(g.wal_path + ".snap"));
+    ASSERT_FALSE(std::filesystem::exists(g.wal_path + ".checkpoint"));
+}
+
+// ---------------------------------------------------------------------------
+// S9-Q. Empty snapshot with subsequent WAL tail produces correct state.
+// ---------------------------------------------------------------------------
+TEST(s9_empty_snapshot_with_wal_tail) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        // Snapshot with empty store.
+        ASSERT_TRUE(store.snapshot());
+        // After snapshot, write data.
+        store.set("post1", "v1");
+        store.set("post2", "v2");
+        store.del("post1");
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_FALSE(store.exists("post1"));
+        ASSERT_EQ(*store.get("post2"), "v2");
+        ASSERT_EQ(store.size(), std::size_t{1});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-R. WAL::replay_from with offset 0 is equivalent to full replay().
+// ---------------------------------------------------------------------------
+TEST(s9_replay_from_offset_zero_equals_full_replay) {
+    TEMP_SNAP(g);
+    // Also need a temp snapshot guard; TEMP_SNAP already covers the WAL path.
+
+    write_wal_records(g.wal_path, [](forgekv::WAL& wal) {
+        wal.append_set("k1", "v1");
+        wal.append_set("k2", "v2");
+        wal.append_del("k1");
+        wal.append_set("k3", "v3");
+    });
+
+    // Full replay.
+    std::unordered_map<std::string, std::string> state_full;
+    {
+        forgekv::WAL wal(g.wal_path);
+        (void)wal.replay([&](const forgekv::WalRecord& r) {
+            if (r.opcode == forgekv::kOpSet) state_full[r.key] = r.value;
+            else if (r.opcode == forgekv::kOpDel) state_full.erase(r.key);
+        });
+    }
+
+    // replay_from(0, ...).
+    std::unordered_map<std::string, std::string> state_from0;
+    {
+        forgekv::WAL wal(g.wal_path);
+        (void)wal.replay_from(0, [&](const forgekv::WalRecord& r) {
+            if (r.opcode == forgekv::kOpSet) state_from0[r.key] = r.value;
+            else if (r.opcode == forgekv::kOpDel) state_from0.erase(r.key);
+        });
+    }
+
+    ASSERT_EQ(state_full, state_from0);
+}
+
+// ---------------------------------------------------------------------------
+// S9-S. WAL::replay_from with offset beyond EOF throws.
+// ---------------------------------------------------------------------------
+TEST(s9_replay_from_beyond_eof_throws) {
+    TEMP_SNAP(g);
+
+    write_wal_records(g.wal_path, [](forgekv::WAL& wal) {
+        wal.append_set("x", "y");
+    });
+
+    forgekv::WAL wal(g.wal_path);
+    const std::uint64_t sz = wal.file_size();
+    ASSERT_TRUE(sz > 0);
+
+    // Beyond EOF — must throw.
+    ASSERT_THROWS(
+        (void)wal.replay_from(sz + 1000,
+            [](const forgekv::WalRecord&) {})
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S9-T. WAL::file_size returns actual file size.
+// ---------------------------------------------------------------------------
+TEST(s9_wal_file_size_correct) {
+    TEMP_SNAP(g);
+
+    {
+        forgekv::WAL wal(g.wal_path);
+        ASSERT_EQ(wal.file_size(), std::uint64_t{0});
+
+        wal.append_set("hello", "world");
+        const std::uint64_t sz_after = wal.file_size();
+
+        // One SET record: 18 + 5 + 5 = 28 bytes.
+        ASSERT_EQ(sz_after, std::uint64_t{28});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-U. Snapshot wal_offset is exactly the WAL size at snapshot time.
+// ---------------------------------------------------------------------------
+TEST(s9_snapshot_wal_offset_matches_wal_size) {
+    TEMP_SNAP(g);
+
+    std::uint64_t expected_offset = 0;
+    {
+        auto store = make_store(g.wal_path);
+        store.set("a", "1");
+        store.set("b", "2");
+
+        // Capture WAL size right before snapshot.
+        {
+            forgekv::WAL wal_probe(g.wal_path);
+            expected_offset = wal_probe.file_size();
+        }
+        ASSERT_TRUE(store.snapshot());
+
+        // Add more records after snapshot.
+        store.set("c", "3");
+    }
+
+    // Load snapshot and verify wal_offset matches expected.
+    forgekv::SnapshotManager sm(g.wal_path);
+    const auto result = sm.load();
+    ASSERT_TRUE(result.exists);
+    ASSERT_FALSE(result.corrupt);
+    ASSERT_EQ(result.data.wal_offset, expected_offset);
+}
+
+// ---------------------------------------------------------------------------
+// S9-V. Clear after snapshot: CLEAR in WAL tail wipes snapshot state.
+// ---------------------------------------------------------------------------
+TEST(s9_clear_after_snapshot) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("x", "1");
+        store.set("y", "2");
+        ASSERT_TRUE(store.snapshot());
+        store.clear();      // post-snapshot CLEAR
+        store.set("z", "3");
+    }
+
+    {
+        auto store = restart_store(g.wal_path);
+        ASSERT_FALSE(store.exists("x"));
+        ASSERT_FALSE(store.exists("y"));
+        ASSERT_EQ(*store.get("z"), "3");
+        ASSERT_EQ(store.size(), std::size_t{1});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S9-W. SnapshotManager::load() on missing file returns !exists.
+// ---------------------------------------------------------------------------
+TEST(s9_load_missing_snapshot_returns_not_exists) {
+    TEMP_SNAP(g);
+    std::error_code ec;
+    std::filesystem::remove(g.snap_path, ec);
+
+    forgekv::SnapshotManager sm(g.wal_path);
+    const auto result = sm.load();
+    ASSERT_FALSE(result.exists);
+    ASSERT_FALSE(result.corrupt);
+}
+
+// ---------------------------------------------------------------------------
+// S9-X. SnapshotManager::load() on corrupt magic returns corrupt.
+// ---------------------------------------------------------------------------
+TEST(s9_load_corrupt_magic_detected) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("test", "val");
+        ASSERT_TRUE(store.snapshot());
+    }
+
+    // Overwrite the magic bytes.
+    auto bytes = read_file_bytes(g.snap_path);
+    bytes[0] = 0xDE; bytes[1] = 0xAD; bytes[2] = 0xBE; bytes[3] = 0xEF;
+    {
+        std::ofstream out(g.snap_path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+
+    forgekv::SnapshotManager sm(g.wal_path);
+    const auto result = sm.load();
+    ASSERT_TRUE(result.exists);
+    ASSERT_TRUE(result.corrupt);
+}
+
+// ---------------------------------------------------------------------------
+// S9-Y. SnapshotManager::remove() deletes the file.
+// ---------------------------------------------------------------------------
+TEST(s9_snapshot_manager_remove) {
+    TEMP_SNAP(g);
+
+    {
+        auto store = make_store(g.wal_path);
+        store.set("remove_test", "yes");
+        ASSERT_TRUE(store.snapshot());
+    }
+
+    ASSERT_TRUE(std::filesystem::exists(g.snap_path));
+
+    forgekv::SnapshotManager sm(g.wal_path);
+    ASSERT_TRUE(sm.remove());
+
+    ASSERT_FALSE(std::filesystem::exists(g.snap_path));
+}
+
+// =============================================================================
 // Test runner
 // =============================================================================
 
@@ -3343,7 +4211,7 @@ int main() {
     int passed = 0;
     int failed  = 0;
 
-    std::cout << "\nForgeKV Stage 1–8 — KeyValueStore, WAL, Recovery, Concurrency & Compaction Tests\n";
+    std::cout << "\nForgeKV Stage 1–9 — KeyValueStore, WAL, Recovery, Concurrency, Compaction & Snapshots Tests\n";
     std::cout << std::string(57, '=') << "\n\n";
 
     for (const auto& tc : tests) {

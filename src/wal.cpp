@@ -603,4 +603,124 @@ void WAL::rewrite(const std::vector<std::pair<std::string, std::string>>& snapsh
     }
 }
 
+// =============================================================================
+// replay_from — partial WAL replay starting at a byte offset
+// =============================================================================
+//
+// Seeks the input stream to `offset`, then delegates to the same loop logic
+// as replay().
+//
+// Offset validation:
+//
+//   If the WAL file does not exist and offset == 0: return empty result (same
+//   as replay() for a missing file).
+//
+//   If the WAL file does not exist and offset > 0: return empty result (the
+//   caller's snapshot said the boundary was offset N, but after compaction or
+//   if the file was deleted, there is nothing to replay).
+//
+//   If offset > file_size: throw std::runtime_error.
+//
+//   If the byte at offset is not the start of a valid record: read_record()
+//   will throw with an "invalid magic" error, which propagates as a fatal
+//   corruption error (consistent with replay() behaviour for corrupted records).
+
+WAL::ReplayResult
+WAL::replay_from(std::uint64_t offset,
+                 std::function<void(const WalRecord&)> callback) const
+{
+    // Open for reading.
+    std::ifstream in(path_, std::ios::binary);
+    if (!in.is_open()) {
+        // File does not exist — no records to replay from any offset.
+        // (Caller's snapshot may have been created before the WAL was reset
+        //  by some edge case; silently return empty result.)
+        return ReplayResult{};
+    }
+
+    if (offset > 0) {
+        // Determine file size to validate offset.
+        in.seekg(0, std::ios::end);
+        const std::uint64_t eof_pos = static_cast<std::uint64_t>(in.tellg());
+
+        if (offset > eof_pos) {
+            throw std::runtime_error(
+                "WAL::replay_from: offset " + std::to_string(offset)
+                + " is beyond end of file (" + std::to_string(eof_pos) + " bytes)");
+        }
+
+        if (offset == eof_pos) {
+            // Offset is exactly at EOF — nothing to replay.
+            return ReplayResult{};
+        }
+
+        // Seek to the requested offset.
+        in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!in) {
+            throw std::runtime_error(
+                "WAL::replay_from: seek to offset "
+                + std::to_string(offset) + " failed");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Replay loop — identical logic to replay() from here on.
+    // -------------------------------------------------------------------------
+    ReplayResult result;
+
+    while (true) {
+        const std::streampos pos_before = in.tellg();
+
+        in.peek();
+        if (in.eof()) {
+            break; // clean EOF
+        }
+
+        try {
+            WalRecord rec = read_record(in);
+            callback(rec);
+            ++result.records_replayed;
+        }
+        catch (const std::runtime_error& e) {
+            const std::string msg = e.what();
+            const bool is_truncation =
+                (msg.rfind("WAL: truncated record (", 0) == 0);
+
+            if (is_truncation) {
+                if (in.eof()) {
+                    result.incomplete_tail = true;
+                    return result;
+                } else {
+                    (void)pos_before;
+                    throw std::runtime_error(
+                        "WAL: recovery failed — truncated record in the "
+                        "middle of the log (not at EOF); log may be corrupted");
+                }
+            } else {
+                throw std::runtime_error(
+                    "WAL: recovery failed — " + msg);
+            }
+        }
+    }
+
+    return result;
+}
+
+// =============================================================================
+// file_size — return the current size of the WAL file in bytes
+// =============================================================================
+//
+// Used by KeyValueStore::snapshot() to capture the WAL boundary position.
+// Returns 0 if the file does not exist.
+
+std::uint64_t WAL::file_size() const noexcept
+{
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(path_, ec);
+    if (ec) {
+        return 0u;
+    }
+    return static_cast<std::uint64_t>(sz);
+}
+
 } // namespace forgekv

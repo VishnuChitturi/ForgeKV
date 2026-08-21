@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     ForgeKV
-    VERSION 0.8.0
+    VERSION 0.9.0
     DESCRIPTION "A persistent, concurrent key-value storage engine built from scratch in C++20"
     LANGUAGES CXX
 )
@@ -35,6 +35,7 @@ add_library(forgekv_core STATIC
     src/in_memory_storage.cpp   # Stage 2: InMemoryStorage implementation
     src/wal.cpp                 # Stage 4: Binary WAL + CRC32 checksums
     src/recovery.cpp            # Stage 5: WAL replay / crash recovery
+    src/snapshot.cpp            # Stage 9: Snapshot manager
 )
 
 # PUBLIC: anything that links forgekv_core also gets this include path.
@@ -145,8 +146,8 @@ target_link_libraries(forgekv_demo1 PRIVATE forgekv_core)
 # ---------------------------------------------------------------------------
 message(STATUS "")
 message(STATUS "Targets configured:")
-message(STATUS "  forgekv_core       — static library (kv_store.cpp, in_memory_storage.cpp, wal.cpp, recovery.cpp)")
-message(STATUS "  forgekv_tests      — test binary    (tests/test_kv_store.cpp)  [Stage 1–8]")
+message(STATUS "  forgekv_core       — static library (kv_store.cpp, in_memory_storage.cpp, wal.cpp, recovery.cpp, snapshot.cpp)")
+message(STATUS "  forgekv_tests      — test binary    (tests/test_kv_store.cpp)  [Stage 1–9]")
 message(STATUS "  forgekv_server     — HTTP server    (src/http_server.cpp, src/main.cpp)  [Stage 6–7]")
 message(STATUS "  forgekv_http_tests — HTTP tests     (tests/test_http_server.cpp)          [Stage 6–7]")
 message(STATUS "  forgekv_demo       — demo binary    (examples/demo.cpp)")

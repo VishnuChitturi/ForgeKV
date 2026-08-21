@@ -287,6 +287,57 @@ public:
     replay(std::function<void(const WalRecord&)> callback) const;
 
     // =========================================================================
+    // Stage 9: Partial WAL replay starting at a byte offset
+    // =========================================================================
+    //
+    // replay_from() is identical to replay() except that it skips to the given
+    // byte offset before reading any records.  This is used by snapshot-based
+    // recovery to replay only the WAL tail that was written AFTER a snapshot.
+    //
+    // Offset rules:
+    //
+    //   offset == 0          — equivalent to replay() (replay from beginning)
+    //
+    //   0 < offset < EOF     — seek to offset; read from there.
+    //                          The byte at `offset` must be the first byte of a
+    //                          valid WAL record header (magic = 0x464B5741).
+    //                          If it is not, std::runtime_error is thrown.
+    //
+    //   offset == EOF        — no records to replay; returns result with
+    //                          records_replayed == 0, incomplete_tail == false.
+    //
+    //   offset >  EOF        — std::runtime_error: offset beyond end of file.
+    //
+    //   offset inside a record — std::runtime_error: the read will fail with
+    //                            an invalid magic error from read_record().
+    //
+    // The existing replay() behaviour for truncated final records and mid-log
+    // corruption applies identically to the tail starting at `offset`.
+    //
+    // Throws std::runtime_error if:
+    //   - The WAL file cannot be opened for reading.
+    //   - offset is beyond EOF.
+    //   - Any complete record (from offset onward) has invalid magic / version /
+    //     opcode / checksum, or a mid-log truncated record.
+    [[nodiscard]] ReplayResult
+    replay_from(std::uint64_t                              offset,
+                std::function<void(const WalRecord&)>      callback) const;
+
+    // =========================================================================
+    // Stage 9: WAL file size query
+    // =========================================================================
+    //
+    // Returns the current size of the WAL file in bytes, or 0 if the file
+    // does not exist.
+    //
+    // Used by KeyValueStore::snapshot() to capture the WAL boundary at the
+    // exact moment of snapshot creation.
+    //
+    // Called under the exclusive lock, so no concurrent appends can change
+    // the size between the state capture and this query.
+    [[nodiscard]] std::uint64_t file_size() const noexcept;
+
+    // =========================================================================
     // Stage 8: WAL compaction — atomic rewrite
     // =========================================================================
     //

@@ -97,6 +97,7 @@
 // =============================================================================
 
 #include "forgekv/recovery.h"
+#include "forgekv/snapshot.h"
 #include "forgekv/storage.h"
 #include "forgekv/wal.h"
 
@@ -203,10 +204,47 @@ public:
     // stream points to the new, compacted file.  Subsequent SET/DELETE/CLEAR
     // operations append to the compacted WAL normally.
     //
+    // Stage 9 note: compact() DELETES the snapshot file (if present) before
+    // rewriting the WAL.  This prevents a stale snapshot from pointing to a
+    // WAL offset that no longer exists in the newly written compacted WAL.
+    //
     // Throws std::runtime_error if the compaction fails (e.g., temp file
     // cannot be created, rename fails, or WAL reopen fails).  On failure
     // before the rename, the original WAL is preserved intact.
     void compact();
+
+    // -------------------------------------------------------------------------
+    // Stage 9: Snapshots
+    // -------------------------------------------------------------------------
+
+    // SNAPSHOT: Create a full-state checkpoint and save it to disk atomically.
+    //
+    // A snapshot records:
+    //   - All live key-value pairs at the moment of creation.
+    //   - The WAL byte offset at the moment of creation.
+    //
+    // On subsequent startup, recovery will:
+    //   1. Load the snapshot (restore in-memory state from saved pairs).
+    //   2. Replay only WAL records written AFTER the snapshot (from the saved
+    //      offset onward).
+    //
+    // This reduces recovery time: instead of replaying the full WAL history,
+    // only the tail needs to be processed.
+    //
+    // Locking:
+    //   snapshot() acquires the EXCLUSIVE lock for its entire duration.
+    //   This guarantees that the captured state and the WAL offset represent
+    //   the SAME logical point in time — no concurrent write can interleave
+    //   between the state capture and the offset query.
+    //
+    // Atomicity:
+    //   The snapshot file is written atomically via a temp-then-rename strategy.
+    //   If writing fails before the rename, any existing snapshot is preserved.
+    //
+    // Returns true on success, false if snapshot creation failed.
+    // Does not throw (all errors are logged/suppressed internally and the
+    // store remains fully operational on snapshot failure).
+    bool snapshot();
 
 private:
     // -------------------------------------------------------------------------
@@ -245,6 +283,10 @@ private:
 
     // Write-ahead log — owned exclusively. Never null after construction.
     std::unique_ptr<WAL> wal_;
+
+    // Snapshot manager — manages the snapshot file at <wal_path>.snapshot.
+    // Constructed lazily from wal_->path() after wal_ is initialised.
+    SnapshotManager snapshot_manager_;
 };
 
 } // namespace forgekv
