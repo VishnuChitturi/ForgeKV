@@ -1,5 +1,5 @@
 // =============================================================================
-// ForgeKV — Stage 16: HttpServer implementation (Key Management API)
+// ForgeKV — Stage 17: HttpServer implementation (Admin Maintenance API)
 // =============================================================================
 //
 // See include/forgekv/http_server.h for the full design and API documentation.
@@ -467,6 +467,62 @@ void HttpServer::register_routes() {
         } catch (const std::exception&) {
             res.status = 500;
             res.set_content(json_error("internal server error"), "application/json");
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /snapshot — trigger an immediate snapshot  (Stage 17)
+    // -------------------------------------------------------------------------
+    //
+    // Calls KeyValueStore::snapshot() which uses the existing locking semantics
+    // (exclusive write lock inside snapshot()). No additional HTTP-level
+    // locking is introduced here.
+    //
+    // Returns 200 + {"status":"ok"}      on success.
+    // Returns 500 + {"error":"..."}      if snapshot() returns false or throws.
+    //
+    // After success the client should call GET /stats to see the updated
+    // last_snapshot_time_us value.
+    server_.Post("/snapshot", [this](const httplib::Request& /*req*/,
+                                     httplib::Response&       res) {
+        try {
+            const bool ok = store_.snapshot();
+            if (ok) {
+                res.status = 200;
+                res.set_content(json_status("ok"), "application/json");
+            } else {
+                res.status = 500;
+                res.set_content(json_error("snapshot failed"), "application/json");
+            }
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(json_error(e.what()), "application/json");
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /compact — trigger WAL compaction  (Stage 17)
+    // -------------------------------------------------------------------------
+    //
+    // Calls KeyValueStore::compact() which rewrites the WAL to contain only
+    // the current live state. Uses the existing compaction locking semantics
+    // (exclusive write lock inside compact()). No additional HTTP-level
+    // locking is introduced here.
+    //
+    // Returns 200 + {"status":"ok"}      on completion.
+    // Returns 500 + {"error":"..."}      on exception.
+    //
+    // Note: compact() does not return a bool — it throws on failure.
+    // All state-invariant guarantees are provided by KeyValueStore::compact().
+    server_.Post("/compact", [this](const httplib::Request& /*req*/,
+                                    httplib::Response&       res) {
+        try {
+            store_.compact();
+            res.status = 200;
+            res.set_content(json_status("ok"), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(json_error(e.what()), "application/json");
         }
     });
 }

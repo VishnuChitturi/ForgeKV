@@ -2,7 +2,7 @@
 
 A persistent, concurrent key-value storage engine built from scratch in C++20.
 
-> **Status:** Stage 16 — Key Management. Full CRUD key browser: GET /keys API, prefix filtering, pagination, create/edit/delete/view modals, TTL management, toast notifications, URL state, responsive layout.
+> **Status:** Stage 17 — Admin Dashboard. Operational control/monitoring page: server health, operation statistics, persistence info, maintenance controls (POST /snapshot, POST /compact), system information, manual refresh, toast notifications.
 > See the [Development Roadmap](#development-roadmap) for the full history.
 
 ---
@@ -153,6 +153,7 @@ Each component is introduced at the appropriate stage. The architecture is desig
 | 14    | Frontend Foundation     | ✅ Complete | React/Vite/TypeScript dashboard shell, API client, routing |
 | 15    | Dashboard               | ✅ Complete | Real /health + /stats dashboard: overview, cards, stats, formatting |
 | 16    | Key Management          | ✅ Complete | GET /keys API, prefix filter, pagination, full CRUD UI, TTL, toasts |
+| 17    | Admin Dashboard         | ✅ Complete | Operational dashboard: health, stats, persistence, POST /snapshot + /compact, system info |
 
 See the `docs/` directory for detailed design notes on each stage.
 
@@ -213,7 +214,7 @@ ForgeKV/
 |---------------|----------------------------|-----------------------------------------------------|
 | Language      | C++20                      | Systems-level control, modern standard library      |
 | Build system  | CMake 3.20+                | Cross-platform, industry standard                   |
-| Testing       | Custom harness (no deps)   | Self-contained; 412 tests across 12 CTest targets   |
+| Testing       | Custom harness (no deps)   | Self-contained; 447 tests across 14 CTest targets   |
 | HTTP server   | cpp-httplib (vendored)     | Single-header, MIT license, no external deps        |
 | Dependencies  | Minimal by design          | Each addition must justify its presence             |
 
@@ -267,7 +268,7 @@ is needed on the C++ server during development.
 |----------|------------|--------------------------|
 | `/`      | Dashboard  | ✅ Implemented (Stage 15) |
 | `/keys`  | Keys       | ✅ Implemented (Stage 16) |
-| `/admin` | Admin      | Placeholder              |
+| `/admin` | Admin      | ✅ Implemented (Stage 17) |
 
 **Configuration:**
 
@@ -283,7 +284,7 @@ decisions, and known limitations.
 
 > **Status: Implemented (Stage 13)**
 
-ForgeKV includes a comprehensive test suite of **433 tests** across 13 CTest targets covering:
+ForgeKV includes a comprehensive test suite of **447 tests** across 14 CTest targets covering:
 
 - **Unit tests** — individual components in isolation (store, WAL, recovery, TTL)
 - **Integration tests** — components working together end-to-end

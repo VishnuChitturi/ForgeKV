@@ -1,0 +1,148 @@
+/* =============================================================================
+   AdminPage — Stage 17
+   ============================================================================= */
+
+/* ---------------------------------------------------------------------------
+   Page header row: title block + actions (last-updated + refresh button)
+   --------------------------------------------------------------------------- */
+.headerRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-shrink: 0;
+  padding-top: 0.25rem;
+}
+
+.lastUpdated {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   Refresh button — same style as DashboardPage for consistency
+   --------------------------------------------------------------------------- */
+.refreshBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.4375rem 0.875rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+
+.refreshBtn:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  color: var(--color-text-primary);
+  border-color: #c9cdd6;
+}
+
+.refreshBtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.refreshIcon {
+  font-size: 1rem;
+  line-height: 1;
+  display: inline-block;
+}
+
+.refreshIconSpin {
+  font-size: 1rem;
+  line-height: 1;
+  display: inline-block;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ---------------------------------------------------------------------------
+   Loading center
+   --------------------------------------------------------------------------- */
+.loadingCenter {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 16rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Error wrapper
+   --------------------------------------------------------------------------- */
+.errorWrapper {
+  max-width: 36rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Main content area
+   --------------------------------------------------------------------------- */
+.content {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+/* Subtle fade while refreshing in background */
+.contentRefreshing {
+  opacity: 0.65;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+
+/* ---------------------------------------------------------------------------
+   Section titles
+   --------------------------------------------------------------------------- */
+.sectionTitle {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  margin: 0 0 0.75rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Detail grid — OperationStats + PersistencePanel side by side
+   --------------------------------------------------------------------------- */
+.detailGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+  gap: 0.875rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Responsive adjustments
+   --------------------------------------------------------------------------- */
+@media (max-width: 639px) {
+  .headerRow {
+    flex-direction: column;
+  }
+
+  .headerActions {
+    padding-top: 0;
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .detailGrid {
+    grid-template-columns: 1fr;
+  }
+}

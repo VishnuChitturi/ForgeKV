@@ -23,6 +23,7 @@ import type {
   KeyListResponse,
   SetKeyResponse,
   StatsResponse,
+  StatusResponse,
 } from "../types/api";
 
 // ---------------------------------------------------------------------------
@@ -173,4 +174,29 @@ export function listKeys(
   }
   const qs = params.toString();
   return request<KeyListResponse>(`/keys${qs ? `?${qs}` : ""}`);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 17: Admin Maintenance API
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /snapshot
+ * Triggers an immediate full-state snapshot on the backend.
+ * Returns { status: "ok" } on success.
+ * On success, call GET /stats to see the updated last_snapshot_time_us.
+ */
+export function postSnapshot(): Promise<ApiResult<StatusResponse>> {
+  return request<StatusResponse>("/snapshot", { method: "POST" });
+}
+
+/**
+ * POST /compact
+ * Triggers WAL compaction on the backend.
+ * Rewrites the WAL to contain only the current live state.
+ * Returns { status: "ok" } on success.
+ * May briefly block write operations while the WAL is rewritten.
+ */
+export function postCompact(): Promise<ApiResult<StatusResponse>> {
+  return request<StatusResponse>("/compact", { method: "POST" });
 }

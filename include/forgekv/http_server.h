@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// ForgeKV — Stage 16: HttpServer (Key Management API)
+// ForgeKV — Stage 17: HttpServer (Admin Maintenance API)
 // =============================================================================
 //
 // HttpServer is a thin HTTP translation layer on top of the ForgeKV engine.
@@ -47,6 +47,21 @@
 //           offset  — how many keys to skip (default: 0)
 //         Keys are sorted lexicographically. Only live (non-expired) keys appear.
 //         400 on invalid limit / offset.
+//
+//   POST   /snapshot    → 200 {"status":"ok"}        (Stage 17)
+//                          500 {"error":"snapshot failed"}
+//         Triggers an immediate full-state checkpoint via
+//         KeyValueStore::snapshot(). Uses the existing snapshot locking
+//         semantics. Does not duplicate snapshot logic.
+//         After success, clients should refresh /stats to see the updated
+//         last_snapshot_time_us.
+//
+//   POST   /compact     → 200 {"status":"ok"}         (Stage 17)
+//                          500 {"error":"compaction failed"}
+//         Rewrites the WAL to contain only the current live state via
+//         KeyValueStore::compact(). Uses existing compaction locking.
+//         Does not implement a second compaction algorithm.
+//         May temporarily block write operations while the WAL is rewritten.
 //
 // Key list entry shape:
 //   {

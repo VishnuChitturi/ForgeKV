@@ -1,0 +1,90 @@
+/* =============================================================================
+   AdminHealth — Stage 17
+   ============================================================================= */
+
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 1.25rem 1.5rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.heading {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  margin: 0 0 1rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Status row — coloured dot + label
+   --------------------------------------------------------------------------- */
+.statusRow {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1.25rem;
+}
+
+.statusDot {
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.statusDot.connected { background: var(--color-status-ok); }
+.statusDot.offline   { background: var(--color-status-error); }
+.statusDot.loading   { background: var(--color-status-loading); }
+
+.statusLabel {
+  font-size: 1.0625rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.text_connected { color: var(--color-text-ok); }
+.text_offline   { color: var(--color-text-error); }
+.text_loading   { color: var(--color-status-loading); }
+
+/* ---------------------------------------------------------------------------
+   Metric list
+   --------------------------------------------------------------------------- */
+.metricList {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.metricRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 0;
+  border-top: 1px solid var(--color-border);
+  gap: 0.5rem;
+}
+
+.metricRow:last-child {
+  /* no bottom border needed — the panel itself provides boundary */
+}
+
+.metricLabel {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.875rem;
+  color: var(--color-text-secondary);
+  font-weight: 500;
+}
+
+.metricValue {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
