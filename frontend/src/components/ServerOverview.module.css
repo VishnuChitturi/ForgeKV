@@ -1,0 +1,124 @@
+/* =============================================================================
+   ServerOverview — horizontal strip with server health and key metrics
+   ============================================================================= */
+
+.overview {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: 0.875rem 1.25rem;
+}
+
+/* ----- individual stat item ----- */
+.item {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.25rem 1.25rem 0.25rem 0;
+  flex-shrink: 0;
+}
+
+.item:first-child {
+  padding-left: 0;
+}
+
+/* ----- vertical divider ----- */
+.divider {
+  width: 1px;
+  height: 2rem;
+  background: var(--color-border);
+  margin-right: 1.25rem;
+  flex-shrink: 0;
+}
+
+/* ----- icon ----- */
+.itemIcon {
+  font-size: 1.0625rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+/* ----- text block ----- */
+.itemText {
+  display: flex;
+  flex-direction: column;
+  gap: 0.0625rem;
+}
+
+.itemLabel {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.itemValue {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ----- status dot ----- */
+.statusDot {
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.statusDot.loading {
+  background: var(--color-status-loading);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.statusDot.connected {
+  background: var(--color-status-ok);
+}
+
+.statusDot.offline {
+  background: var(--color-status-error);
+}
+
+/* ----- status text colour variants ----- */
+.statusText_connected {
+  color: var(--color-text-ok);
+}
+
+.statusText_offline {
+  color: var(--color-text-error);
+}
+
+.statusText_loading {
+  color: var(--color-status-loading);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.35; }
+}
+
+/* ----- responsive: wrap items vertically on mobile ----- */
+@media (max-width: 639px) {
+  .overview {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+    padding: 1rem;
+  }
+
+  .divider {
+    display: none;
+  }
+
+  .item {
+    padding: 0;
+  }
+}

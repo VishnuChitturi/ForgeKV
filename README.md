@@ -2,7 +2,7 @@
 
 A persistent, concurrent key-value storage engine built from scratch in C++20.
 
-> **Status:** Stage 13 — Final Hardening. KV engine, HTTP server, WAL, snapshots, compaction, TTL, statistics, benchmark suite, and comprehensive test suite all implemented.
+> **Status:** Stage 15 — Dashboard. Real /health + /stats dashboard with server overview, summary cards, statistics tables, and responsive layout.
 > See the [Development Roadmap](#development-roadmap) for the full history.
 
 ---
@@ -151,6 +151,7 @@ Each component is introduced at the appropriate stage. The architecture is desig
 | 12    | Benchmarking            | ✅ Complete | Throughput, latency, and resource benchmarks             |
 | 13    | Final Hardening         | ✅ Complete | 157 new tests: WAL/recovery/snapshot/TTL/concurrency hardening |
 | 14    | Frontend Foundation     | ✅ Complete | React/Vite/TypeScript dashboard shell, API client, routing |
+| 15    | Dashboard               | ✅ Complete | Real /health + /stats dashboard: overview, cards, stats, formatting |
 
 See the `docs/` directory for detailed design notes on each stage.
 
@@ -261,11 +262,11 @@ is needed on the C++ server during development.
 
 **Routes:**
 
-| Path     | Page       | Status         |
-|----------|------------|----------------|
-| `/`      | Dashboard  | Placeholder    |
-| `/keys`  | Keys       | Placeholder    |
-| `/admin` | Admin      | Placeholder    |
+| Path     | Page       | Status                   |
+|----------|------------|--------------------------|
+| `/`      | Dashboard  | ✅ Implemented (Stage 15) |
+| `/keys`  | Keys       | Placeholder              |
+| `/admin` | Admin      | Placeholder              |
 
 **Configuration:**
 
