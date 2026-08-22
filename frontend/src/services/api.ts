@@ -27,12 +27,22 @@ import type {
 } from "../types/api";
 
 // ---------------------------------------------------------------------------
-// Base path
+// Base URL
 //
-// All API calls go through /api which the Vite dev proxy rewrites to the
-// backend root. In production, set VITE_API_BASE_URL appropriately.
+// In production builds, VITE_API_BASE_URL is baked in at build time and used
+// as the full backend origin (e.g. "https://forgekv.onrender.com").
+// Paths are appended directly: base + "/health", base + "/stats", etc.
+//
+// In local development (VITE_API_BASE_URL is empty / not set), we fall back
+// to "/api" so the Vite dev-server proxy can rewrite /api/* → backend root
+// without any CORS configuration on the C++ server.
+//
+// Trailing slash is stripped from the env value to avoid double-slashes when
+// the path (which always starts with "/") is appended.
 // ---------------------------------------------------------------------------
-const API_PREFIX = "/api";
+const API_PREFIX: string = import.meta.env.VITE_API_BASE_URL
+  ? (import.meta.env.VITE_API_BASE_URL as string).replace(/\/$/, "")
+  : "/api";
 
 // ---------------------------------------------------------------------------
 // Internal helper: perform a fetch and normalise into ApiResult<T>
