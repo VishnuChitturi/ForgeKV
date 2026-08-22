@@ -1,181 +1,123 @@
 # ForgeKV
 
-A persistent, concurrent key-value storage engine built from scratch in C++20.
+A persistent, concurrent key-value storage engine built from scratch in C++20, with a React/TypeScript management dashboard.
 
-> **Status:** Stage 19 — UI Polish & Integration. Consistent navigation, shared design tokens, heading hierarchy fixes, Modal focus trap, post-delete pagination clamping, searchInput URL sync, skip-to-main link, corrected Admin page title, benchmark flash fix.
-> See the [Development Roadmap](#development-roadmap) for the full history.
+ForgeKV implements durability guarantees from first principles: binary write-ahead log, CRC32 corruption detection, crash recovery, log compaction, snapshots, TTL expiration, and thread-safe concurrent access — all without external storage dependencies.
 
 ---
 
 ## Table of Contents
 
-1. [What is ForgeKV?](#what-is-forgekv)
-2. [Motivation](#motivation)
-3. [What is a Key-Value Store?](#what-is-a-key-value-store)
-4. [Why In-Memory Storage?](#why-in-memory-storage)
-5. [Why Persistence is Needed](#why-persistence-is-needed)
-6. [High-Level Architecture](#high-level-architecture)
-7. [Development Roadmap](#development-roadmap)
-8. [Planned Features](#planned-features)
-9. [Project Structure](#project-structure)
-10. [Technology Stack](#technology-stack)
-11. [Building the Project](#building-the-project)
-12. [Frontend Dashboard](#frontend-dashboard)
-13. [Testing Strategy](#testing-strategy)
-14. [Benchmarking Strategy](#benchmarking-strategy)
-15. [Learning Objectives](#learning-objectives)
+1. [Overview](#overview)
+2. [Features](#features)
+3. [Architecture](#architecture)
+4. [Tech Stack](#tech-stack)
+5. [Project Structure](#project-structure)
+6. [Building the Backend](#building-the-backend)
+7. [Running ForgeKV](#running-forgekv)
+8. [HTTP API](#http-api)
+9. [Running the Frontend](#running-the-frontend)
+10. [Dashboard](#dashboard)
+11. [Benchmarking](#benchmarking)
+12. [Testing](#testing)
+13. [Persistence and Recovery](#persistence-and-recovery)
+14. [Design Decisions](#design-decisions)
+15. [Limitations](#limitations)
 16. [Future Improvements](#future-improvements)
+17. [Project Status](#project-status)
 
 ---
 
-## What is ForgeKV?
+## Overview
 
-ForgeKV is a key-value storage engine written in C++20, built entirely from first principles as a learning and portfolio project. It starts as a simple in-memory hash map and evolves — stage by stage — into a networked, crash-safe, concurrent storage system.
+ForgeKV is a key-value storage engine written in C++20, built as a learning and portfolio project. It starts as a simple in-memory hash map and grows — stage by stage — into a networked, crash-safe, concurrent storage system with a web management UI.
 
-This is not a production replacement for Redis, RocksDB, or any mature database. The goal is to demonstrate a deep understanding of how persistent storage systems actually work by building one from the ground up.
+The primary goal is to demonstrate a deep understanding of how persistent storage systems work by building one from first principles. Every design decision — from the binary WAL record format to the snapshot-plus-replay recovery model to the shared-mutex concurrency scheme — is made deliberately and documented explicitly.
 
----
-
-## Motivation
-
-Most developers interact with storage systems at the API level: call `SET`, call `GET`, receive a result. But what happens inside? How does data survive a power loss? How does the system reconstruct its state after a crash? How does it serve hundreds of clients simultaneously without corrupting data?
-
-ForgeKV exists to answer those questions through implementation. Every design decision — from the in-memory data structure to the binary WAL record format to the concurrency model — is made consciously and documented explicitly.
-
-Building ForgeKV means being able to explain, at a technical interview, how a storage engine works from the lowest level up.
+This is not a production replacement for Redis, RocksDB, or any mature database. It is a complete, working storage engine that can explain itself at every layer.
 
 ---
 
-## What is a Key-Value Store?
+## Features
 
-A key-value store is the simplest useful form of a database. It maintains a mapping from keys to values, where:
+**Storage engine**
+- In-memory store backed by `std::unordered_map`
+- Write-Ahead Log (WAL) — every mutation is persisted before the in-memory state changes
+- Binary WAL format with magic number, version byte, and CRC32 checksum per record
+- Crash recovery — WAL replay reconstructs state on restart
+- Snapshots — full-state checkpoints that accelerate recovery startup
+- Log compaction — rewrites WAL to remove obsolete entries, reclaiming disk space
+- TTL / key expiration — optional per-key time-to-live with background cleanup
 
-- A **key** is a unique identifier (e.g., a string like `"username"`)
-- A **value** is the data associated with that key (e.g., `"vishnu"`)
+**Concurrency**
+- `std::shared_mutex` — concurrent reads, exclusive writes
+- Background TTL cleanup thread (1-second interval)
+- Thread-safe HTTP request handling via cpp-httplib's default thread pool
 
-The core operations are:
+**HTTP interface**
+- REST API: GET, PUT, DELETE individual keys; list keys; health check; statistics; snapshot; compact
+- X-TTL-Seconds header on PUT for per-request TTL
+- GET /keys with prefix filtering and cursor-style pagination
 
-| Operation | Description                                   |
-|-----------|-----------------------------------------------|
-| `SET`     | Store or update a value for a given key       |
-| `GET`     | Retrieve the value for a given key            |
-| `DELETE`  | Remove a key-value pair                       |
-| `EXISTS`  | Check whether a key is present                |
+**Observability**
+- GET /stats: key count, operation counters, WAL size, uptime, last snapshot time
 
-This maps naturally to a hash map: `std::unordered_map<std::string, std::string>` in C++.
+**Benchmark suite**
+- Measures throughput (ops/sec), latency percentiles (avg, P50, P95, P99), concurrency scalability, HTTP throughput, snapshot and compaction timing
+- JSON output artifact consumed by the dashboard's Analytics tab
 
-Real-world examples of key-value stores include Redis, DynamoDB, etcd, and RocksDB.
-
----
-
-## Why In-Memory Storage?
-
-RAM is orders of magnitude faster than disk. A CPU can access RAM in nanoseconds; a disk seek takes microseconds to milliseconds. Keeping the active dataset in memory means operations are fast by default.
-
-ForgeKV starts with an in-memory `std::unordered_map` because:
-
-1. It is the simplest correct implementation of the core semantics.
-2. Average `O(1)` complexity for `GET`, `SET`, `DELETE`, and `EXISTS`.
-3. It creates a clean baseline to build persistence on top of.
-
-The in-memory store is not the final design — it is the foundation.
+**Management dashboard**
+- React/TypeScript SPA with three views: Dashboard (live stats), Keys (full CRUD), Admin (maintenance + analytics)
 
 ---
 
-## Why Persistence is Needed
+## Architecture
 
-RAM is **volatile**. When a process exits, crashes, or the machine restarts, everything in memory is gone. For a storage engine, this is unacceptable.
+```mermaid
+graph TD
+    Browser["React Frontend\n(Dashboard / Keys / Admin)"]
+    Browser -->|HTTP /api/*| HTTPServer
 
-ForgeKV will address this with a **Write-Ahead Log (WAL)**. Before any mutation is applied to the in-memory state, a record of that mutation is appended to a log file on disk. On restart, the log is replayed to reconstruct the in-memory state.
+    subgraph Backend["ForgeKV Backend (C++20)"]
+        HTTPServer["HttpServer\n(cpp-httplib)"]
+        HTTPServer --> KVStore
 
-```
-Without persistence:
-  Process crash → all data lost
-
-With WAL:
-  Process crash → restart → replay WAL → state restored
+        KVStore["KeyValueStore"]
+        KVStore -->|shared_mutex| Storage["InMemoryStorage\n(std::unordered_map)"]
+        KVStore --> WAL["WAL\n(binary append-only log)"]
+        KVStore --> Snapshot["SnapshotManager"]
+        KVStore --> Recovery["Recovery\n(WAL replay on startup)"]
+        KVStore --> TTL["Background cleanup thread\n(1-second interval)"]
+        KVStore --> Stats["Stats\n(atomic counters)"]
+    end
 ```
 
-Persistence is what separates a storage engine from a plain data structure.
+**Component responsibilities**
+
+- `KeyValueStore` is the central coordinator. All operations pass through it; it owns the `shared_mutex` and coordinates WAL writes with storage mutations.
+- `InMemoryStorage` holds the live key-value map and per-key expiry timestamps.
+- `WAL` appends binary records to disk before each mutation. Provides `replay()` for recovery.
+- `SnapshotManager` writes and loads full-state checkpoint files, storing the WAL byte offset at snapshot time.
+- `Recovery` (called by `KeyValueStore` constructor) loads the most recent valid snapshot, then replays only the WAL tail written after that snapshot.
+- `HttpServer` is a thin REST layer; it parses requests, calls `KeyValueStore`, and serializes JSON responses. It does not own any state.
+- The TTL cleanup thread runs `do_expire_pass()` every second under an exclusive lock; it writes DEL records to the WAL for expired keys.
+- Stats counters are `std::atomic<uint64_t>` updated without the storage mutex; `GET /stats` reads them with `memory_order_relaxed`.
 
 ---
 
-## High-Level Architecture
+## Tech Stack
 
-> **Note:** This is the planned final architecture. Only the in-memory store is currently being built.
+| Component | Choice | Reason |
+|-----------|--------|--------|
+| Language | C++20 | Systems-level control; `std::shared_mutex`, `std::latch`, `std::barrier`, `std::optional` |
+| Build system | CMake 3.20+ | Cross-platform, industry standard |
+| HTTP library | cpp-httplib (vendored) | Single-header, MIT license, no external build dependencies |
+| Testing | Custom harness (no deps) | Zero external test framework; 447 tests across 14 CTest targets |
+| Frontend | React 18 + Vite 5 + TypeScript | Component model, fast dev server, type safety |
+| Frontend routing | React Router v6 | Declarative client-side routing |
+| Frontend CSS | CSS Modules | Scoped styles, no CSS-in-JS overhead |
 
-```
-Client
-  │
-  ▼
-HTTP Server              ← exposes REST API (Stage 6)
-  │
-  ▼
-KV Engine                ← central coordinator
-  │
-  ├── In-Memory State    ← std::unordered_map (Stage 1)
-  │
-  ├── WAL Manager        ← write-ahead log (Stage 3–4)
-  │
-  ├── Recovery Manager   ← WAL replay on startup (Stage 5)
-  │
-  ├── Snapshot Manager   ← periodic state checkpoints (Stage 9)
-  │
-  ├── Compaction Manager ← WAL space reclamation (Stage 8)
-  │
-  ├── TTL Manager        ← key expiration (Stage 10)
-  │
-  └── Statistics         ← operational metrics (Stage 11)
-```
-
-Each component is introduced at the appropriate stage. The architecture is designed so each layer adds capability without breaking the previous one.
-
----
-
-## Development Roadmap
-
-| Stage | Title                   | Status      | Description                                              |
-|-------|-------------------------|-------------|----------------------------------------------------------|
-| 0     | Project Foundation      | ✅ Complete | Repo structure, build system, documentation              |
-| 1     | In-Memory Store         | ✅ Complete | `KeyValueStore` backed by `unordered_map`                |
-| 2     | Storage Abstraction     | ✅ Complete | Decouple engine from concrete map implementation         |
-| 3     | Write-Ahead Log (text)  | ✅ Complete | Append-only log for mutations                            |
-| 4     | Binary WAL              | ✅ Complete | Structured binary record format with checksums           |
-| 5     | Crash Recovery          | ✅ Complete | Replay WAL on startup to reconstruct state               |
-| 6     | HTTP Server             | ✅ Complete | REST API over HTTP                                       |
-| 7     | Concurrency             | ✅ Complete | Thread-safe access with `std::shared_mutex`              |
-| 8     | Log Compaction          | ✅ Complete | Reclaim WAL space by removing obsolete entries           |
-| 9     | Snapshots               | ✅ Complete | Periodic full-state checkpoints                          |
-| 10    | TTL / Expiration        | ✅ Complete | Key expiry with background cleanup                       |
-| 11    | Statistics              | ✅ Complete | Operational metrics and observability                    |
-| 12    | Benchmarking            | ✅ Complete | Throughput, latency, and resource benchmarks             |
-| 13    | Final Hardening         | ✅ Complete | 157 new tests: WAL/recovery/snapshot/TTL/concurrency hardening |
-| 14    | Frontend Foundation     | ✅ Complete | React/Vite/TypeScript dashboard shell, API client, routing |
-| 15    | Dashboard               | ✅ Complete | Real /health + /stats dashboard: overview, cards, stats, formatting |
-| 16    | Key Management          | ✅ Complete | GET /keys API, prefix filter, pagination, full CRUD UI, TTL, toasts |
-| 17    | Admin Dashboard         | ✅ Complete | Operational dashboard: health, stats, persistence, POST /snapshot + /compact, system info |
-| 18    | Analytics + Performance | ✅ Complete | Live analytics: GET hit rate, op breakdown, persistence; benchmark: throughput, latency, concurrency, HTTP, snapshot/compaction |
-| 19    | UI Polish & Integration | ✅ Complete | Frontend consistency: shared Page styles, skip-to-main, Modal focus trap, heading hierarchy, Admin title fix, benchmark flash fix, URL sync |
-
-See the `docs/` directory for detailed design notes on each stage.
-
----
-
-## Planned Features
-
-All features below are **planned**. None are currently implemented.
-
-- **Persistence** via Write-Ahead Log
-- **Binary WAL** with structured records and checksums
-- **Crash recovery** — replay WAL on startup
-- **HTTP REST API** — `SET`, `GET`, `DELETE`, `EXISTS`, `health`, `stats`
-- **Concurrency** — thread-safe reads and writes
-- **Log compaction** — reclaim disk space, speed up recovery
-- **Snapshots** — periodic full-state checkpoints
-- **TTL** — optional key expiration
-- **Statistics** — key count, operation counts, WAL size, uptime
-- **Benchmarks** — measured throughput, latency percentiles
-- **Test suite** — unit, integration, crash, concurrency, stress tests
+External C++ dependencies are limited to one vendored header (`third_party/httplib/httplib.h`). No other libraries are required to build or run the backend.
 
 ---
 
@@ -183,67 +125,232 @@ All features below are **planned**. None are currently implemented.
 
 ```
 ForgeKV/
-├── README.md              ← This file
-├── CMakeLists.txt         ← Build system configuration
-├── .gitignore
+├── CMakeLists.txt          ← Build configuration; defines all targets
+├── README.md
 │
-├── include/               ← Public header files (populated from Stage 1)
-├── src/                   ← Implementation files (populated from Stage 1)
-├── tests/                 ← Test suite (Stage 13)
-├── benchmarks/            ← Benchmark suite (Stage 12)
-├── examples/              ← Usage examples (future)
+├── include/forgekv/        ← Public C++ headers
+│   ├── kv_store.h          ← KeyValueStore (central coordinator)
+│   ├── wal.h               ← WAL binary format, record layout, replay API
+│   ├── snapshot.h          ← SnapshotManager
+│   ├── recovery.h          ← WAL replay helpers
+│   ├── storage.h           ← Storage abstract interface
+│   ├── in_memory_storage.h ← std::unordered_map implementation
+│   ├── http_server.h       ← HttpServer REST layer
+│   └── stats.h             ← Stats struct
 │
-└── docs/
-    ├── 01-project-overview.md
-    ├── 02-in-memory-store.md
-    ├── 03-write-ahead-log.md
-    ├── 04-crash-recovery.md
-    ├── 05-http-server.md
-    ├── 06-concurrency.md
-    ├── 07-log-compaction.md
-    ├── 08-snapshots.md
-    ├── 09-ttl.md
-    ├── 10-benchmarking.md
-    ├── 11-testing.md
-    └── 12-final-architecture.md
+├── src/                    ← Implementation files
+│   ├── kv_store.cpp
+│   ├── wal.cpp
+│   ├── snapshot.cpp
+│   ├── recovery.cpp
+│   ├── in_memory_storage.cpp
+│   ├── http_server.cpp
+│   └── main.cpp            ← forgekv_server entry point
+│
+├── tests/                  ← Test suite (14 binaries, 447 tests)
+│   ├── test_kv_store.cpp           ← Stages 1–12 baseline (218 tests)
+│   ├── test_http_server.cpp        ← HTTP integration (37 tests)
+│   ├── test_http_keys.cpp          ← GET /keys endpoint (21 tests)
+│   ├── test_http_admin.cpp         ← POST /snapshot + /compact (14 tests)
+│   ├── test_wal_robustness.cpp     ← WAL corruption/truncation (22 tests)
+│   ├── test_recovery_hardening.cpp ← Crash recovery (15 tests)
+│   ├── test_snapshot_hardening.cpp ← Snapshot integrity (20 tests)
+│   ├── test_compaction_robustness.cpp ← Compaction invariants (14 tests)
+│   ├── test_ttl_hardening.cpp      ← TTL edge cases (23 tests)
+│   ├── test_concurrency_hardening.cpp ← Thread safety (12 tests)
+│   ├── test_http_edge_cases.cpp    ← HTTP edge cases (18 tests)
+│   ├── test_boundary_cases.cpp     ← Input boundaries (17 tests)
+│   ├── test_lifecycle.cpp          ← Resource lifecycle (13 tests)
+│   └── test_randomized.cpp         ← State-machine fuzz (3 tests)
+│
+├── benchmarks/             ← Benchmark suite
+│   ├── benchmark_main.cpp
+│   ├── bench_harness.h
+│   ├── benchmark_kv_store.cpp
+│   └── benchmark_http.cpp
+│
+├── frontend/               ← React/TypeScript dashboard
+│   ├── src/
+│   │   ├── pages/          ← DashboardPage, KeysPage, AdminPage
+│   │   ├── components/     ← Shared UI components
+│   │   ├── services/api.ts ← HTTP client
+│   │   ├── types/          ← TypeScript types
+│   │   └── utils/          ← Formatting and benchmark utilities
+│   ├── public/
+│   │   └── benchmark-results.json ← Pre-generated benchmark artifact
+│   ├── vite.config.ts
+│   └── package.json
+│
+├── docs/                   ← Stage-by-stage design notes (01–19)
+├── third_party/httplib/    ← Vendored cpp-httplib
+└── examples/               ← C++ usage examples
 ```
 
 ---
 
-## Technology Stack
-
-| Component     | Choice                     | Reason                                              |
-|---------------|----------------------------|-----------------------------------------------------|
-| Language      | C++20                      | Systems-level control, modern standard library      |
-| Build system  | CMake 3.20+                | Cross-platform, industry standard                   |
-| Testing       | Custom harness (no deps)   | Self-contained; 447 tests across 14 CTest targets   |
-| HTTP server   | cpp-httplib (vendored)     | Single-header, MIT license, no external deps        |
-| Dependencies  | Minimal by design          | Each addition must justify its presence             |
-
-External libraries are introduced only when they provide clear value over a from-scratch implementation.
-
----
-
-## Building the Project
+## Building the Backend
 
 **Prerequisites:** CMake 3.20+, a C++20-capable compiler (GCC 11+, Clang 13+, or Apple Clang 14+).
 
 ```bash
 git clone https://github.com/yourusername/ForgeKV.git
 cd ForgeKV
-cmake -B build
-cmake --build build
+
+# Configure (Debug by default)
+cmake -S . -B build
+
+# Configure Release (faster; recommended for benchmarks)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+# Build all targets
+cmake --build build --parallel
 ```
 
-At Stage 0 there are no build targets. CMake configuration should succeed and print a status summary.
+This produces:
+- `build/forgekv_server` — the HTTP server
+- `build/forgekv_benchmark` — the benchmark suite
+- All test binaries (`build/forgekv_tests`, `build/forgekv_http_tests`, etc.)
 
 ---
 
-## Frontend Dashboard
+## Running ForgeKV
 
-> **Status: Implemented (Stage 14)**
+```bash
+# Default: listens on 127.0.0.1:8080
+./build/forgekv_server
 
-ForgeKV ships a local web dashboard built with React, Vite, and TypeScript.
+# Custom port
+./build/forgekv_server 9090
+```
+
+On startup the server:
+1. Constructs `KeyValueStore`, which opens `forgekv.wal` in the current working directory.
+2. Runs crash recovery automatically (snapshot load + WAL replay if needed).
+3. Starts the HTTP server and begins accepting requests.
+
+The WAL file (`forgekv.wal`) and snapshot file (`forgekv.wal.snapshot`) are written to the directory you run the server from. Run from the project root or a dedicated data directory.
+
+---
+
+## HTTP API
+
+All endpoints return `Content-Type: application/json`. The server binds to `127.0.0.1` only; there is no authentication.
+
+### Key operations
+
+#### `GET /key/:key`
+
+Retrieve the value for a key.
+
+| Response | Condition |
+|----------|-----------|
+| `200 {"key":"...","value":"..."}` | Key exists and is not expired |
+| `404 {"error":"key not found"}` | Key missing or expired |
+| `500 {"error":"internal server error"}` | Unexpected exception |
+
+#### `PUT /key/:key`
+
+Store or update a value. The raw request body is the value.
+
+| Header | Description |
+|--------|-------------|
+| `X-TTL-Seconds` | Optional. Positive number (integer or decimal). Sets key expiry. Omit for permanent storage. |
+
+| Response | Condition |
+|----------|-----------|
+| `200 {"status":"ok"}` | Stored successfully |
+| `400 {"error":"value cannot be empty"}` | Empty request body |
+| `400 {"error":"X-TTL-Seconds must be a positive number"}` | Non-numeric TTL header |
+| `400 {"error":"X-TTL-Seconds must be greater than 0"}` | TTL ≤ 0 |
+| `500 {"error":"internal server error"}` | Unexpected exception |
+
+#### `DELETE /key/:key`
+
+Remove a key.
+
+| Response | Condition |
+|----------|-----------|
+| `200 {"status":"ok"}` | Key existed and was deleted |
+| `404 {"error":"key not found"}` | Key missing or already expired |
+| `500 {"error":"internal server error"}` | Unexpected exception |
+
+### Listing keys
+
+#### `GET /keys`
+
+List live (non-expired) keys with optional filtering and pagination.
+
+**Query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `prefix` | string | `""` | Return only keys with this prefix |
+| `limit` | integer | `50` | Page size; maximum `100` |
+| `offset` | integer | `0` | Skip this many matched keys |
+
+**Response (200):**
+```json
+{
+  "keys": [
+    { "key": "session:abc", "value": "user42", "ttl_seconds": 87.432 },
+    { "key": "config:theme", "value": "dark", "ttl_seconds": -1.0 }
+  ],
+  "total": 2,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`ttl_seconds` is `-1.0` for permanent keys and a non-negative float for keys with active TTL.
+
+Keys are sorted lexicographically. Only live keys are included. The snapshot is taken under the shared lock once, so the page is consistent.
+
+| Response | Condition |
+|----------|-----------|
+| `200 {...}` | Success (empty `keys` array is valid) |
+| `400 {"error":"..."}` | Invalid `limit` or `offset` |
+| `500 {"error":"internal server error"}` | Unexpected exception |
+
+### Health and statistics
+
+#### `GET /health`
+
+Always returns `200 {"status":"ok"}`. Does not access the store.
+
+#### `GET /stats`
+
+Returns current operational metrics.
+
+```json
+{
+  "key_count": 1042,
+  "get_hits": 58341,
+  "get_misses": 214,
+  "set_count": 1201,
+  "delete_count": 159,
+  "ttl_set_count": 87,
+  "expired_count": 23,
+  "wal_size_bytes": 204800,
+  "uptime_seconds": 312.45,
+  "last_snapshot_time_us": 1724330258000000
+}
+```
+
+`last_snapshot_time_us` is `0` if no snapshot has been taken this process lifetime. `uptime_seconds` is elapsed time since process start (does not persist across restarts).
+
+### Maintenance
+
+#### `POST /snapshot`
+
+Triggers an immediate full-state snapshot. Returns `200 {"status":"ok"}` on success, `500` on failure. After success, `GET /stats` reflects the updated `last_snapshot_time_us`.
+
+#### `POST /compact`
+
+Triggers WAL compaction. Rewrites the WAL to contain only the current live state; expired keys are excluded; live TTL keys are preserved with their expiry metadata. The snapshot file is deleted during compaction (prevents stale snapshot references). Returns `200 {"status":"ok"}` on success, `500` on exception.
+
+---
+
+## Running the Frontend
 
 **Prerequisites:** Node.js 18+, npm 8+.
 
@@ -251,128 +358,355 @@ ForgeKV ships a local web dashboard built with React, Vite, and TypeScript.
 cd frontend
 npm install
 npm run dev       # development server at http://localhost:5173
-npm run build     # production build → frontend/dist/
-npm run preview   # serve the production build locally
 ```
 
-Start the ForgeKV backend before opening the dashboard:
+Start the ForgeKV backend first:
 
 ```bash
-./build/forgekv_server          # listens on 127.0.0.1:8080 by default
+./build/forgekv_server   # listens on 127.0.0.1:8080 by default
 ```
 
-The Vite dev server proxies `/api/*` to the backend, so no CORS configuration
-is needed on the C++ server during development.
-
-**Routes:**
-
-| Path     | Page       | Status                   |
-|----------|------------|--------------------------|
-| `/`      | Dashboard  | ✅ Implemented (Stage 15) |
-| `/keys`  | Keys       | ✅ Implemented (Stage 16) |
-| `/admin` | Admin      | ✅ Implemented (Stage 17) |
+The Vite dev server proxies all `/api/*` requests to `VITE_API_BASE_URL` (default `http://localhost:8080`), stripping the `/api` prefix before forwarding. No CORS configuration is needed on the C++ server during development.
 
 **Configuration:**
 
-Copy `frontend/.env.example` to `frontend/.env.local` and set
-`VITE_API_BASE_URL` if your backend runs on a non-default port.
+The default backend URL is `http://localhost:8080`. To change it:
 
-See `docs/14-frontend-foundation.md` for the full architecture, design
-decisions, and known limitations.
+```bash
+# frontend/.env.local (already in .gitignore)
+VITE_API_BASE_URL=http://localhost:9090
+```
+
+**Production build:**
+
+```bash
+npm run build     # outputs to frontend/dist/
+npm run preview   # serves the production build locally
+```
 
 ---
 
-## Testing Strategy
+## Dashboard
 
-> **Status: Implemented (Stage 13)**
+The frontend provides three views, accessible from the navigation bar.
 
-ForgeKV includes a comprehensive test suite of **447 tests** across 14 CTest targets covering:
+**Dashboard (`/`)**
 
-- **Unit tests** — individual components in isolation (store, WAL, recovery, TTL)
-- **Integration tests** — components working together end-to-end
-- **Persistence tests** — data survives process restart
-- **WAL tests** — correct record format, ordering, flushing, and corruption detection
-- **Corruption tests** — partial records and checksum failures handled gracefully
-- **Crash recovery tests** — state correctly reconstructed after simulated crash
-- **Concurrency tests** — no data races under multi-threaded access using `std::latch` and `std::barrier`
-- **Stress tests** — behavior under sustained high load
-- **Snapshot tests** — corruption fallback, TTL preservation, boundary correctness
-- **Compaction tests** — state invariants before and after, interaction with snapshots and TTL
-- **TTL tests** — boundary conditions, persistence, expiry across restart
-- **HTTP edge-case tests** — status codes, special characters, concurrent requests
-- **GET /keys tests** — pagination, prefix filter, ordering, TTL metadata, expired keys, concurrency
-- **Boundary/input tests** — empty keys, large values, binary-safe strings, Unicode
-- **Lifecycle tests** — resource cleanup, temp file removal, server start/stop
-- **Randomized tests** — fixed-seed state-machine comparison against a reference model
+Live server health indicator and operational statistics pulled from `GET /health` and `GET /stats`. Shows key count, operation totals (GET hits/misses, SET, DELETE, TTL SET, expired), WAL size, uptime, and last snapshot time.
 
-Run with:
+**Keys (`/keys`)**
+
+Full key management UI:
+- Browse all live keys with value and TTL display
+- Filter by prefix
+- Paginate through results
+- Create new keys (with optional TTL)
+- Edit existing values
+- Delete keys
+- View per-key TTL metadata
+
+**Admin (`/admin`)**
+
+Two sections:
+
+*Server health and statistics* — same live metrics as the Dashboard, plus direct controls for triggering a snapshot or WAL compaction. Health, operation stats, and persistence stats are pulled from the live API.
+
+*Analytics and benchmark results* — displays the contents of `frontend/public/benchmark-results.json`. This is a static artifact generated from a benchmark run; it is not a live request rate or current server throughput. The benchmark notice is displayed inline to make this clear.
+
+**There is no authentication.** The "Dashboard" and "Admin" labels are UI organizational concepts only. ForgeKV does not implement user accounts, sessions, roles, permissions, or private namespaces. The UI is intended for local development and portfolio use.
+
+---
+
+## Benchmarking
+
+The benchmark suite measures real, reproducible performance on actual hardware. No numbers are invented.
+
+**Build and run:**
 
 ```bash
-cmake --build build
+# Prefer Release build for accurate throughput numbers
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target forgekv_benchmark
+
+# Default run (10,000 ops for HTTP, 100,000 for KV-level)
+./build/forgekv_benchmark
+
+# Common options
+./build/forgekv_benchmark --operations 50000   # ops per workload
+./build/forgekv_benchmark --no-http            # skip HTTP benchmark
+./build/forgekv_benchmark --no-latency         # skip latency sampling
+./build/forgekv_benchmark --value-size 1024    # 1 KB values
+./build/forgekv_benchmark --threads 8          # concurrency cap
+./build/forgekv_benchmark --help               # full usage
+```
+
+**CLI options:**
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--operations` | `-n` | 100,000 | Operations per workload |
+| `--warmup` | `-w` | 1,000 | Warmup ops (not measured) |
+| `--value-size` | `-v` | 128 | Value size in bytes |
+| `--threads` | `-t` | 4 | Max threads for concurrency benchmarks |
+| `--output` | `-o` | (none) | CSV output file path |
+| `--no-latency` | | latency on | Skip per-op latency sampling |
+| `--no-http` | | HTTP on | Skip HTTP-level workloads |
+| `--large` | | off | Run 1,000,000-operation suite |
+| `--json-output <file>` | | (none) | Write JSON artifact to file |
+| `--format json` | | (none) | Write JSON artifact to stdout |
+| `--help` | `-h` | | Show usage and exit |
+
+**Workloads measured:**
+
+- Sequential SET, GET (hit), GET (miss), DELETE
+- Mixed workload (50% GET / 30% SET / 10% DELETE / 10% GET miss)
+- TTL SET (`set_with_ttl`)
+- Snapshot timing
+- Compaction timing and WAL reduction
+- Concurrent GET, SET, Mixed at 1/2/4/N threads
+- Per-op latency (avg, P50, P95, P99 in microseconds)
+- HTTP-level GET, PUT, Mixed at 1/2/4/N threads
+
+**Generating the dashboard artifact:**
+
+```bash
+./build/forgekv_benchmark --json-output frontend/public/benchmark-results.json
+```
+
+This writes the JSON artifact loaded by the Admin dashboard's Analytics tab. The repository includes a pre-generated copy at `frontend/public/benchmark-results.json` (generated on macOS, Clang 17, C++20, 8 hardware threads). Numbers from that file are measurements from that specific environment and are not universal performance guarantees.
+
+The benchmark does not run automatically during `ctest`. It is intentionally excluded from the CTest suite.
+
+---
+
+## Testing
+
+ForgeKV includes 447 tests across 14 CTest targets.
+
+**Run all tests:**
+
+```bash
+cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-See `docs/13-final-hardening.md` for the full hardening strategy, failure scenarios tested, sanitizer commands, and known limitations.
+**Test targets and counts:**
+
+| Target | Tests | Coverage area |
+|--------|-------|---------------|
+| `forgekv_tests` | 218 | Stages 1–12 baseline: store, WAL, recovery, TTL, snapshots, compaction, stats |
+| `forgekv_http_tests` | 37 | HTTP REST integration (Stage 6–7) |
+| `forgekv_tests_http_keys` | 21 | GET /keys: pagination, prefix filter, TTL metadata, concurrency |
+| `forgekv_tests_http_admin` | 14 | POST /snapshot + POST /compact HTTP endpoints |
+| `forgekv_tests_wal` | 22 | WAL binary format, corruption, truncation, replay edge cases |
+| `forgekv_tests_recovery` | 15 | Realistic restart sequences, snapshot+WAL interactions |
+| `forgekv_tests_snapshot` | 20 | Snapshot robustness, corruption fallback, WAL offset correctness |
+| `forgekv_tests_compaction` | 14 | Compaction state invariants, interaction with snapshots and TTL |
+| `forgekv_tests_ttl` | 23 | TTL boundary conditions, expiry timing, persistence across restart |
+| `forgekv_tests_concurrency` | 12 | Thread safety: concurrent reads/writes, no data races |
+| `forgekv_tests_http_edge` | 18 | HTTP edge cases: status codes, special characters, concurrent requests |
+| `forgekv_tests_boundary` | 17 | Empty keys, large values, null bytes, Unicode, control characters |
+| `forgekv_tests_lifecycle` | 13 | Resource cleanup, temp file removal, server start/stop cycles |
+| `forgekv_tests_randomized` | 3 | Fixed-seed state-machine comparison against a reference model |
+| **Total** | **447** | |
+
+**Sanitizer builds (manual, not in CTest):**
+
+```bash
+# AddressSanitizer + UndefinedBehaviorSanitizer
+cmake -B build_asan -DCMAKE_BUILD_TYPE=Debug -DFORGEKV_ASAN=ON
+cmake --build build_asan --parallel
+cd build_asan && ./forgekv_tests && ./forgekv_tests_concurrency
+
+# ThreadSanitizer
+cmake -B build_tsan -DCMAKE_BUILD_TYPE=Debug -DFORGEKV_TSAN=ON
+cmake --build build_tsan --parallel
+cd build_tsan && ./forgekv_tests && ./forgekv_tests_concurrency
+```
+
+ASAN and TSAN are mutually exclusive. See `docs/13-final-hardening.md` for the full hardening strategy.
 
 ---
 
-## Benchmarking Strategy
+## Persistence and Recovery
 
-> **Status: Implemented (Stage 12)**
+### Write path
 
-ForgeKV includes a benchmark suite measuring actual, reproducible performance on real hardware. No numbers are invented or estimated in advance.
+Every mutation follows the write-ahead protocol:
 
-Metrics measured:
+```
+PUT /key/:key
+    ↓
+HttpServer parses request
+    ↓
+KeyValueStore::set() acquires exclusive lock
+    ↓
+WAL::append_set() writes binary record to disk
+    ↓
+stream.flush() drains the library buffer
+    ↓
+InMemoryStorage::set() updates the hash map
+    ↓
+Lock released — response sent
+```
 
-- GET / SET / DELETE throughput (operations per second)
-- Average, P50, P95, and P99 latency
-- WAL file size vs. operation count
-- Compaction time and space savings
-- Snapshot time and file size
-- Concurrency scalability (1, 2, 4, 8 threads)
-- HTTP-level throughput (GET, PUT, mixed)
+If the WAL write fails, the in-memory state is not changed and a `std::runtime_error` is thrown. The storage mutation only happens after the WAL record is durable in the OS page cache.
 
-Results are obtained by running `./build/forgekv_benchmark`. See `docs/12-benchmarking.md` for full details.
+### Binary WAL format
+
+Each record on disk:
+
+```
+Offset  Size  Field
+     0     4  Magic number (0x464B5741, little-endian)
+     4     1  Format version (0x01)
+     5     1  Operation code (SET=0x01, DEL=0x02, CLEAR=0x03, SET_WITH_EXPIRY=0x04)
+     6     4  Key length (little-endian uint32)
+    10     4  Value length (little-endian uint32)
+    14     K  Key bytes
+  14+K     V  Value bytes
+14+K+V     4  CRC32 checksum (covers bytes 0..14+K+V-1, little-endian)
+```
+
+A corrupt checksum or invalid magic/version/opcode causes replay to throw immediately. A truncated final record (crash tail) is tolerated — earlier records are applied and the tail is discarded.
+
+### Recovery on startup
+
+```
+KeyValueStore constructor
+    ↓
+Check for forgekv.wal.snapshot
+    ↓
+If valid snapshot exists:
+    Load snapshot into InMemoryStorage
+    Note WAL byte offset stored in snapshot header
+    Replay only WAL records written after that offset
+Else (no snapshot or corrupt snapshot):
+    Full WAL replay from offset 0
+    (Corrupt snapshot logs a warning to stderr and falls back — safe)
+    ↓
+Store is ready; stats counters start at zero
+```
+
+### Snapshots
+
+`POST /snapshot` (or `KeyValueStore::snapshot()`) writes a full-state checkpoint including all live keys and their expiry timestamps. The snapshot file stores the WAL byte offset at snapshot time; recovery uses this to skip records that are already captured in the snapshot.
+
+### Compaction
+
+`POST /compact` (or `KeyValueStore::compact()`) rewrites the WAL to contain only the current live state. Expired keys are excluded. Live TTL keys are rewritten with `SET_WITH_EXPIRY` records. The snapshot file is deleted during compaction to prevent stale offset references. The WAL is replaced atomically (rename-based).
+
+### TTL expiration
+
+Keys stored with `set_with_ttl()` carry an absolute expiry timestamp (microseconds since Unix epoch). `get()`, `exists()`, and `ttl()` treat expired keys as absent. The background cleanup thread wakes every second, acquires the exclusive lock, writes `DEL` WAL records for expired keys, and removes them from storage. Expired keys are excluded from snapshots and compacted WALs.
 
 ---
 
-## Learning Objectives
+## Design Decisions
 
-By building ForgeKV, the following topics are explored hands-on:
+**WAL before storage mutation**
+Writing to disk first is the core durability guarantee. If the process crashes after the WAL write but before the storage mutation, recovery replays the record. If the process crashes before the WAL write, neither side has changed. There is no window where data is in storage but not in the WAL.
 
-| Topic                     | Stage    |
-|---------------------------|----------|
-| C++ data structures       | 1        |
-| Storage abstraction       | 2        |
-| File I/O and durability   | 3        |
-| Binary serialization      | 4        |
-| Crash recovery            | 5        |
-| HTTP and networking       | 6        |
-| Threads and mutexes       | 7        |
-| Log compaction            | 8        |
-| Snapshots/checkpointing   | 9        |
-| TTL and expiration        | 10       |
-| Observability             | 11       |
-| Performance benchmarking  | 12       |
-| Systems testing           | 13       |
+**Binary WAL format instead of text**
+A binary format with explicit field lengths and CRC32 checksums allows corruption to be detected at the record level rather than failing silently with garbled data. Field lengths make records self-describing, so replay does not depend on delimiters that could appear in values.
+
+**Snapshots separate from WAL**
+Snapshots accelerate recovery: instead of replaying the entire WAL history, recovery loads the snapshot and replays only the tail. The snapshot stores the WAL offset at the time it was taken, so the two are always synchronized. Compaction deletes the snapshot because a freshly compacted WAL starts at offset 0 and an old snapshot pointing into the previous WAL's offsets would be invalid.
+
+**`KeyValueStore` owns synchronization**
+All locking is centralized in `KeyValueStore`. `InMemoryStorage` is not thread-safe by itself; `HttpServer` does not acquire any locks. This makes the concurrency model simple to reason about: one mutex, one owner.
+
+**`std::shared_mutex` for reader/writer separation**
+Reads (`get`, `exists`, `size`, `ttl`, `list_keys`) acquire shared locks and run concurrently. Writes (`set`, `del`, `clear`, `compact`, `snapshot`) acquire exclusive locks. This is correct for a storage engine where reads are typically more frequent than writes.
+
+**Stats counters as atomics outside the mutex**
+Operation counters are `std::atomic<uint64_t>` updated without the storage mutex. A slightly stale view of stats is acceptable for observability; holding the write lock for counter increments would reduce write throughput unnecessarily.
+
+**Benchmark results as a static artifact**
+The dashboard's Analytics tab displays benchmark data from `frontend/public/benchmark-results.json` rather than polling the live server. Benchmarks measure throughput under controlled conditions; presenting them as live metrics would be misleading. The artifact is generated once with `--json-output` and committed alongside the frontend.
+
+**No authentication**
+ForgeKV is a single-process, local storage engine for development and portfolio use. Adding authentication would complicate the codebase without advancing the core learning objectives. The Admin and Dashboard labels in the UI are purely organizational.
+
+---
+
+## Limitations
+
+- **No fsync.** ForgeKV calls `stream.flush()` after each WAL record, which drains the standard library buffer into the OS page cache. It does not call `fsync()`. A power loss between the OS write-back and physical storage commit could lose the last written record. This is a known durability limitation.
+
+- **Single-process, single-node.** There is no replication, clustering, or distributed coordination. One WAL, one process, one data directory.
+
+- **No authentication or authorization.** Any process that can reach the HTTP port has full read/write access.
+
+- **Background TTL cleanup granularity.** Expired keys may remain in memory for up to 1 second after expiration (the background thread interval). They are invisible to API callers but do contribute to peak memory usage until the next cleanup pass.
+
+- **No real-time benchmark metrics.** The Admin dashboard's Analytics tab shows a static benchmark artifact. It does not reflect live request rates or current server performance.
+
+- **Benchmark artifact requires manual regeneration.** If you run benchmarks on your machine, regenerate the JSON artifact and copy it to `frontend/public/benchmark-results.json` to keep the dashboard numbers current.
+
+- **Single snapshot file.** Only one snapshot is retained per WAL path. A new `snapshot()` call replaces the previous one.
+
+- **No multi-instance safety.** Two `KeyValueStore` instances pointing to the same WAL file would corrupt it. This is not a supported use case.
+
+- **ThreadSanitizer on macOS.** TSAN may report false positives for `std::condition_variable::wait_for` in some Apple Clang versions. These are known standard library instrumentation artifacts, not ForgeKV data races.
 
 ---
 
 ## Future Improvements
 
-Ideas beyond the current roadmap, considered only after Stage 13 is complete:
+These are directions to explore after Stage 20. None are currently implemented.
 
-- Replace `std::unordered_map` with a custom hash table
-- LSM-tree or B-tree storage backend as an alternative engine
-- Replication across multiple nodes
-- Write batching and atomic multi-key transactions
-- Bloom filters for negative-lookup optimization
-- Memory-mapped I/O for the WAL
-- gRPC or binary protocol as an alternative to HTTP
-- Persistent memory (pmem) support
-
-These are aspirational. ForgeKV will not claim to support them until they are built and tested.
+- **fsync / group commit** — true durability guarantee against power loss
+- **Improved TTL scheduling** — heap-based expiry instead of periodic full scan
+- **Memory limits** — cap in-memory dataset size with eviction policy
+- **Distributed replication** — leader/follower WAL streaming
+- **Authentication** — API key or token-based access control
+- **Historical metrics** — time-series stats for dashboard charts
+- **Automated benchmark pipeline** — CI-driven benchmark artifact regeneration
+- **Alternative storage backend** — LSM-tree or B-tree as a drop-in `Storage` implementation
+- **Write batching** — atomic multi-key transactions
+- **Bloom filter** — reduce WAL read amplification for negative-lookup optimizations
 
 ---
 
-*ForgeKV is a learning project by Vishnu. Built from first principles, one stage at a time.*
+## Development Roadmap
+
+| Stage | Title | Status |
+|-------|-------|--------|
+| 0 | Project Foundation | ✅ Complete |
+| 1 | In-Memory Store | ✅ Complete |
+| 2 | Storage Abstraction | ✅ Complete |
+| 3 | Write-Ahead Log (text) | ✅ Complete |
+| 4 | Binary WAL + CRC32 | ✅ Complete |
+| 5 | Crash Recovery | ✅ Complete |
+| 6 | HTTP Server | ✅ Complete |
+| 7 | Concurrency | ✅ Complete |
+| 8 | Log Compaction | ✅ Complete |
+| 9 | Snapshots | ✅ Complete |
+| 10 | TTL / Expiration | ✅ Complete |
+| 11 | Statistics / Observability | ✅ Complete |
+| 12 | Benchmarking | ✅ Complete |
+| 13 | Final Hardening | ✅ Complete |
+| 14 | Frontend Foundation | ✅ Complete |
+| 15 | Dashboard | ✅ Complete |
+| 16 | Key Management | ✅ Complete |
+| 17 | Admin Dashboard | ✅ Complete |
+| 18 | Analytics + Performance | ✅ Complete |
+| 19 | UI Polish + Full Integration | ✅ Complete |
+| 20 | Documentation + Final Verification | ✅ Complete |
+
+See the `docs/` directory for detailed design notes on each stage.
+
+---
+
+## Project Status
+
+**Stage 20 — Complete**
+
+ForgeKV has completed all planned stages. The backend implements a fully functional persistent key-value storage engine with WAL, crash recovery, snapshots, compaction, TTL, concurrency, and an HTTP API. The frontend provides a complete management and observability interface.
+
+This is a portfolio and educational project. It demonstrates how a storage engine works from first principles — not a production system. It has not been tested under production load, has no authentication, and does not provide fsync-level durability guarantees.
+
+---
+
+*ForgeKV — built from first principles, one stage at a time.*

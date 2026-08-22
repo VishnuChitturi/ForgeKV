@@ -4,6 +4,12 @@
 **Status:** Complete  
 **Test result:** 412 tests, 0 failures (12/12 CTest targets)
 
+> **Note (Stage 20):** Stages 16 and 17 added two additional CTest targets —
+> `forgekv_tests_http_keys` (21 tests, GET /keys endpoint) and
+> `forgekv_tests_http_admin` (14 tests, POST /snapshot + POST /compact).
+> The current project total is **447 tests across 14 CTest targets**.
+> The counts in this document reflect the state at the end of Stage 13 only.
+
 ---
 
 ## Overview
@@ -277,7 +283,7 @@ Two test-side bugs were discovered during Stage 13 (no production code was modif
 
 ---
 
-## Final Test Counts
+## Final Test Counts (Stage 13)
 
 | Test binary | Tests | Status |
 |-------------|-------|--------|
@@ -296,6 +302,10 @@ Two test-side bugs were discovered during Stage 13 (no production code was modif
 | **Total** | **412** | **0 failures** |
 
 CTest result: **100% tests passed, 12/12 targets.**
+
+> **Stage 20 note:** Stages 16 and 17 added `forgekv_tests_http_keys` (21 tests)
+> and `forgekv_tests_http_admin` (14 tests), bringing the project total to
+> **447 tests across 14 CTest targets**. See `README.md` for the current full table.
 
 ---
 

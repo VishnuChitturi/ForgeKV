@@ -3,6 +3,12 @@
 > **Stage:** All stages contribute to this document.  
 > **Status:** 🔲 Planned. This describes the intended final architecture. No implementation exists yet.
 
+> **Stage 20 note:** This is an early planning document describing the intended
+> architecture before all stages were implemented. The actual architecture is
+> reflected in the source code under `include/forgekv/` and `src/`, and is
+> summarized with a Mermaid diagram in `README.md`. The HTTP endpoint list in
+> this document is incomplete — see `README.md` for the current full API.
+
 ---
 
 ## Overview

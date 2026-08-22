@@ -3,6 +3,11 @@
 > **Stage:** 13  
 > **Status:** 🔲 Planned. This document describes the testing strategy. No tests exist yet.
 
+> **Stage 20 note:** This is an early planning document written before Stage 13
+> was implemented. The actual test results are documented in
+> `docs/13-final-hardening.md`. The project currently has **447 tests across
+> 14 CTest targets**. Run with: `ctest --test-dir build --output-on-failure`.
+
 ---
 
 ## Philosophy

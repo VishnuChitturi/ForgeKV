@@ -3,6 +3,12 @@
 > **Stage:** 12  
 > **Status:** 🔲 Planned. This document describes the benchmarking strategy. No numbers exist yet.
 
+> **Stage 20 note:** This is an early planning document written before Stage 12
+> was implemented. The actual benchmark implementation is documented in
+> `docs/12-benchmarking.md`. The benchmark executable is `build/forgekv_benchmark`;
+> the pre-generated JSON artifact is at `frontend/public/benchmark-results.json`.
+> See `README.md` for verified build and run instructions.
+
 ---
 
 ## Principle: Measure, Don't Estimate
