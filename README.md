@@ -16,16 +16,17 @@ ForgeKV implements durability guarantees from first principles: binary write-ahe
 6. [Building the Backend](#building-the-backend)
 7. [Running ForgeKV](#running-forgekv)
 8. [Deployment](#deployment)
-9. [HTTP API](#http-api)
-10. [Running the Frontend](#running-the-frontend)
-11. [Dashboard](#dashboard)
-12. [Benchmarking](#benchmarking)
-13. [Testing](#testing)
-14. [Persistence and Recovery](#persistence-and-recovery)
-15. [Design Decisions](#design-decisions)
-16. [Limitations](#limitations)
-17. [Future Improvements](#future-improvements)
-18. [Project Status](#project-status)
+9. [Docker](#docker)
+10. [HTTP API](#http-api)
+11. [Running the Frontend](#running-the-frontend)
+12. [Dashboard](#dashboard)
+13. [Benchmarking](#benchmarking)
+14. [Testing](#testing)
+15. [Persistence and Recovery](#persistence-and-recovery)
+16. [Design Decisions](#design-decisions)
+17. [Limitations](#limitations)
+18. [Future Improvements](#future-improvements)
+19. [Project Status](#project-status)
 
 ---
 
@@ -269,6 +270,59 @@ cd /data   # persistent disk mount point
 ```
 
 If persistence across restarts is not required (e.g., a stateless demo), no special configuration is needed.
+
+---
+
+## Docker
+
+A production-ready Dockerfile is included at the project root. It uses a two-stage build: a Debian Bookworm builder that compiles `forgekv_server` with GCC and CMake, and a minimal runtime image that contains only the binary.
+
+**Build the image:**
+
+```bash
+docker build -t forgekv:latest .
+```
+
+**Run the container (default port 8080):**
+
+```bash
+docker run -p 8080:8080 forgekv:latest
+```
+
+Verify the server is up:
+
+```bash
+curl http://localhost:8080/health
+# {"status":"ok"}
+```
+
+**Run on a custom port (e.g. 9090):**
+
+```bash
+docker run -p 9090:9090 -e PORT=9090 forgekv:latest
+```
+
+ForgeKV reads the `PORT` environment variable automatically — no rebuild needed.
+
+**Persist WAL data across restarts:**
+
+By default the WAL is written inside the container at `/data/forgekv.wal` and is lost when the container is removed. Mount a host directory to retain data:
+
+```bash
+docker run -p 8080:8080 -v /your/data/dir:/data forgekv:latest
+```
+
+**Image details:**
+
+| Property | Value |
+|----------|-------|
+| Builder base | `debian:bookworm-slim` |
+| Runtime base | `debian:bookworm-slim` |
+| Compiler | GCC 12.2.0 |
+| Build type | Release |
+| Runtime user | `forgekv` (non-root) |
+| Working directory | `/data` |
+| Default port | `8080` |
 
 ---
 
