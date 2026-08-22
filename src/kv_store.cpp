@@ -1,34 +1,45 @@
 // =============================================================================
-// ForgeKV — Stage 9: KeyValueStore implementation (Snapshots)
+// ForgeKV — Stage 10: KeyValueStore implementation (TTL / Expiration)
 // =============================================================================
 //
-// Stage 9 adds two capabilities:
+// Stage 10 adds:
 //
-//   1. snapshot() — create a full-state binary checkpoint.
+//   1. set_with_ttl(key, value, ttl_seconds)
+//      - Computes absolute expiration: now + ttl_seconds (as microseconds).
+//      - Writes kOpSetWithExpiry WAL record.
+//      - Calls storage_->set_with_expiry().
+//      - ttl_seconds <= 0: key is not stored (immediately expired).
 //
-//      Under the exclusive lock, snapshot() captures all live key-value pairs
-//      and the current WAL file size (byte offset).  It delegates to
-//      SnapshotManager::save() which writes the snapshot atomically via a
-//      temp-then-rename strategy.
+//   2. ttl(key)
+//      - Returns kTtlPermanent (-1.0) if key exists and is permanent.
+//      - Returns kTtlNotFound  (-2.0) if key is missing or expired.
+//      - Returns remaining seconds (>=0.0) if key is expiring.
 //
-//   2. Updated recover() — snapshot-aware startup recovery.
+//   3. Background cleanup thread.
+//      - Wakes every cleanup_interval_ or on shutdown.
+//      - Calls do_expire_pass() under the exclusive lock.
+//      - do_expire_pass() removes expired keys from storage and writes WAL
+//        DEL records so expirations are durable across restarts.
+//      - Thread is started after recover() returns.
+//      - Thread is stopped/joined in the destructor.
 //
-//      If a valid snapshot file exists at <wal_path>.snapshot:
-//        a. Load the snapshot into in-memory storage.
-//        b. Replay only WAL records at or after the snapshot's wal_offset.
-//      If no snapshot exists (or if it is corrupt):
-//        a. Fall back to full WAL replay from offset 0.
-//      The logical state after either path is identical.
+//   4. Updated recover():
+//      - Handles kOpSetWithExpiry records from WAL.
+//      - Skips already-expired records during recovery.
+//      - Loads v2 snapshot records with expiry metadata.
 //
-//   3. Updated compact() — deletes the snapshot before WAL rewrite.
+//   5. Updated compact():
+//      - Excludes expired keys from the compacted WAL.
+//      - Writes SET_WITH_EXPIRY for live expiring keys.
 //
-//      Compaction rewrites the WAL from scratch (offset 0).  Any existing
-//      snapshot's wal_offset would refer to the OLD WAL inode and is now
-//      meaningless.  compact() removes the snapshot file before calling
-//      wal_->rewrite(), so that subsequent recovery always uses WAL-only
-//      replay (which is correct because the compacted WAL has the full state).
+//   6. Updated snapshot():
+//      - Excludes expired keys.
+//      - Preserves expiry metadata for live expiring keys.
 //
-// All locking invariants from Stage 7 and Stage 8 are preserved unchanged.
+// Locking model (unchanged from Stage 7):
+//   READ ops:   shared_lock (get, exists, size, empty, ttl)
+//   WRITE ops:  exclusive lock (set, set_with_ttl, del, clear, compact, snapshot)
+//   CLEANUP:    exclusive lock (short pass, writes WAL DEL records)
 // =============================================================================
 
 #include "forgekv/kv_store.h"
@@ -37,120 +48,228 @@
 #include "forgekv/snapshot.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <shared_mutex>
+#include <stdexcept>
 
 namespace forgekv {
 
-// Default WAL path used when none is explicitly provided.
+// Default WAL path.
 static constexpr const char* kDefaultWalPath = "forgekv.wal";
 
-// -----------------------------------------------------------------------------
+// =============================================================================
+// Time helper
+// =============================================================================
+
+// Returns current wall-clock time as microseconds since Unix epoch.
+static std::uint64_t current_time_us() noexcept {
+    const auto now = std::chrono::system_clock::now();
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            now.time_since_epoch())
+            .count());
+}
+
+// =============================================================================
+// Helper: start the cleanup thread
+// =============================================================================
+
+static void start_cleanup_thread(
+    std::thread& th,
+    std::atomic<bool>& stop_flag,
+    std::mutex& cv_mutex,
+    std::condition_variable& cv,
+    std::chrono::milliseconds interval,
+    std::function<void()> work)
+{
+    th = std::thread([&stop_flag, &cv_mutex, &cv, interval,
+                      work = std::move(work)]() mutable {
+        while (!stop_flag.load(std::memory_order_relaxed)) {
+            // Wait for interval or until notified (shutdown).
+            std::unique_lock<std::mutex> lk(cv_mutex);
+            cv.wait_for(lk, interval,
+                        [&stop_flag]() {
+                            return stop_flag.load(std::memory_order_relaxed);
+                        });
+            lk.unlock();
+
+            if (stop_flag.load(std::memory_order_relaxed)) {
+                break;
+            }
+
+            // Run the cleanup pass.
+            work();
+        }
+    });
+}
+
+// =============================================================================
 // Default constructor
-// -----------------------------------------------------------------------------
+// =============================================================================
+
 KeyValueStore::KeyValueStore()
     : storage_(std::make_unique<InMemoryStorage>()),
       wal_(std::make_unique<WAL>(kDefaultWalPath)),
       snapshot_manager_(kDefaultWalPath)
 {
     recover();
+    start_cleanup_thread(
+        cleanup_thread_, stop_cleanup_,
+        cleanup_cv_mutex_, cleanup_cv_,
+        cleanup_interval_,
+        [this]() {
+            std::unique_lock lock(mutex_);
+            (void)do_expire_pass();
+        });
 }
 
-// -----------------------------------------------------------------------------
-// Full dependency-injection constructor
-// -----------------------------------------------------------------------------
+// =============================================================================
+// Full DI constructor
+// =============================================================================
+
 KeyValueStore::KeyValueStore(std::unique_ptr<Storage> storage,
                              std::unique_ptr<WAL>     wal)
     : storage_(std::move(storage)),
       wal_(std::move(wal)),
-      snapshot_manager_("") // temporary — fixed below after null check
+      snapshot_manager_("")
 {
     if (!storage_) {
-        throw std::invalid_argument(
-            "KeyValueStore: storage must not be null");
+        throw std::invalid_argument("KeyValueStore: storage must not be null");
     }
     if (!wal_) {
-        throw std::invalid_argument(
-            "KeyValueStore: wal must not be null");
+        throw std::invalid_argument("KeyValueStore: wal must not be null");
     }
-    // Reinitialise snapshot_manager_ now that we know wal_ is valid.
     snapshot_manager_ = SnapshotManager(wal_->path());
     recover();
+    start_cleanup_thread(
+        cleanup_thread_, stop_cleanup_,
+        cleanup_cv_mutex_, cleanup_cv_,
+        cleanup_interval_,
+        [this]() {
+            std::unique_lock lock(mutex_);
+            (void)do_expire_pass();
+        });
 }
 
-// -----------------------------------------------------------------------------
-// Storage-only injection constructor (backward compatibility)
-// -----------------------------------------------------------------------------
+// =============================================================================
+// Storage-only constructor (backward compatibility)
+// =============================================================================
+
 KeyValueStore::KeyValueStore(std::unique_ptr<Storage> storage)
     : storage_(std::move(storage)),
       wal_(std::make_unique<WAL>(kDefaultWalPath)),
       snapshot_manager_(kDefaultWalPath)
 {
     if (!storage_) {
-        throw std::invalid_argument(
-            "KeyValueStore: storage must not be null");
+        throw std::invalid_argument("KeyValueStore: storage must not be null");
     }
     recover();
+    start_cleanup_thread(
+        cleanup_thread_, stop_cleanup_,
+        cleanup_cv_mutex_, cleanup_cv_,
+        cleanup_interval_,
+        [this]() {
+            std::unique_lock lock(mutex_);
+            (void)do_expire_pass();
+        });
 }
 
-// -----------------------------------------------------------------------------
-// Move constructor
-// -----------------------------------------------------------------------------
-KeyValueStore::KeyValueStore(KeyValueStore&& other) noexcept
-    : snapshot_manager_()  // default-initialised; overwritten below
+// =============================================================================
+// Destructor — stop and join the cleanup thread
+// =============================================================================
+
+KeyValueStore::~KeyValueStore()
 {
+    // Signal the cleanup thread to stop.
+    stop_cleanup_.store(true, std::memory_order_relaxed);
+
+    // Wake it up so it doesn't wait the full interval.
+    cleanup_cv_.notify_all();
+
+    // Join — waits for the thread to finish.
+    if (cleanup_thread_.joinable()) {
+        cleanup_thread_.join();
+    }
+}
+
+// =============================================================================
+// Move constructor
+// =============================================================================
+
+KeyValueStore::KeyValueStore(KeyValueStore&& other) noexcept
+    : snapshot_manager_()
+{
+    // Stop the other's cleanup thread before moving its state.
+    other.stop_cleanup_.store(true, std::memory_order_relaxed);
+    other.cleanup_cv_.notify_all();
+    if (other.cleanup_thread_.joinable()) {
+        other.cleanup_thread_.join();
+    }
+
     std::unique_lock lock(other.mutex_);
     storage_          = std::move(other.storage_);
     wal_              = std::move(other.wal_);
     snapshot_manager_ = std::move(other.snapshot_manager_);
+    cleanup_interval_ = other.cleanup_interval_;
+
+    // Start a new cleanup thread for the moved-to object.
+    stop_cleanup_.store(false, std::memory_order_relaxed);
+    start_cleanup_thread(
+        cleanup_thread_, stop_cleanup_,
+        cleanup_cv_mutex_, cleanup_cv_,
+        cleanup_interval_,
+        [this]() {
+            std::unique_lock lk(mutex_);
+            (void)do_expire_pass();
+        });
 }
 
-// -----------------------------------------------------------------------------
-// recover — snapshot-aware startup recovery
-// -----------------------------------------------------------------------------
+// =============================================================================
+// recover — snapshot-aware startup recovery (Stage 10 extended)
+// =============================================================================
 //
-// Algorithm:
-//
-//   1. Ask the SnapshotManager to load the snapshot file.
-//
-//   2a. If a VALID snapshot exists:
-//         - Apply all snapshot key-value pairs to storage_ directly.
-//         - Call WAL::replay_from(wal_offset, callback) to replay only the
-//           WAL tail written after the snapshot.
-//
-//   2b. If NO snapshot exists:
-//         - Call WAL::replay() / Recovery::run() as before (full replay).
-//
-//   2c. If the snapshot is CORRUPT:
-//         - Log a warning to stderr.
-//         - Fall back to full WAL replay.
-//         - The corrupt snapshot file is left on disk untouched (caller may
-//           overwrite it with a new snapshot() call).
-//
-// Note: recovery runs in the constructor, before the store is exposed to
-// threads.  No locking is needed here.
+// Handles:
+//   A. kOpSet               → permanent key
+//   B. kOpSetWithExpiry     → expiring key; skip if already expired
+//   C. kOpDel               → remove key
+//   D. kOpClear             → clear all keys
+//   E. Snapshot v1 records  → permanent keys
+//   F. Snapshot v2 records  → expiry-aware; skip already-expired entries
+
 void KeyValueStore::recover()
 {
     const auto snap_result = snapshot_manager_.load();
 
     if (snap_result.exists && !snap_result.corrupt) {
-        // ----------------------------------------------------------------
-        // Path A: valid snapshot found — load it, then replay WAL tail.
-        // ----------------------------------------------------------------
+        // Path A: valid snapshot — restore it, then replay WAL tail.
         const SnapshotData& snap = snap_result.data;
 
-        // Restore snapshot state into storage_.
-        for (const auto& [key, value] : snap.records) {
-            storage_->set(key, value);
+        // Restore snapshot state. load() already excluded expired entries.
+        for (const auto& [key, entry] : snap.records) {
+            if (entry.has_expiry()) {
+                storage_->set_with_expiry(key, entry.value, entry.expires_at_us);
+            } else {
+                storage_->set(key, entry.value);
+            }
         }
 
-        // Replay WAL records written after the snapshot boundary.
+        // Replay WAL tail.
         (void)wal_->replay_from(
             snap.wal_offset,
             [this](const WalRecord& rec) {
+                const std::uint64_t now = current_time_us();
                 switch (rec.opcode) {
                     case kOpSet:
                         storage_->set(rec.key, rec.value);
+                        break;
+                    case kOpSetWithExpiry:
+                        // Skip already-expired entries.
+                        if (rec.expires_at_us > 0 && rec.expires_at_us <= now) {
+                            break; // expired before recovery completed
+                        }
+                        storage_->set_with_expiry(rec.key, rec.value,
+                                                   rec.expires_at_us);
                         break;
                     case kOpDel:
                         storage_->del(rec.key);
@@ -166,24 +285,82 @@ void KeyValueStore::recover()
             });
 
     } else {
-        // ----------------------------------------------------------------
-        // Path B / C: no snapshot, or corrupt snapshot — full WAL replay.
-        // ----------------------------------------------------------------
+        // Path B / C: no snapshot, or corrupt — full WAL replay.
         if (snap_result.exists && snap_result.corrupt) {
-            // Warn but do not abort. Fall back to WAL-only recovery.
             std::cerr << "[ForgeKV] WARNING: snapshot is corrupt and will be "
                          "ignored. Falling back to full WAL recovery. ("
                       << snap_result.error_msg << ")\n";
         }
 
-        Recovery recovery(*wal_, *storage_);
-        (void)recovery.run();
+        // Full replay handles all opcodes including kOpSetWithExpiry.
+        (void)wal_->replay(
+            [this](const WalRecord& rec) {
+                const std::uint64_t now = current_time_us();
+                switch (rec.opcode) {
+                    case kOpSet:
+                        storage_->set(rec.key, rec.value);
+                        break;
+                    case kOpSetWithExpiry:
+                        if (rec.expires_at_us > 0 && rec.expires_at_us <= now) {
+                            break; // already expired
+                        }
+                        storage_->set_with_expiry(rec.key, rec.value,
+                                                   rec.expires_at_us);
+                        break;
+                    case kOpDel:
+                        storage_->del(rec.key);
+                        break;
+                    case kOpClear:
+                        storage_->clear();
+                        break;
+                    default:
+                        throw std::runtime_error(
+                            "Recovery: unexpected opcode: "
+                            + std::to_string(static_cast<int>(rec.opcode)));
+                }
+            });
     }
 }
 
-// -----------------------------------------------------------------------------
-// set
-// -----------------------------------------------------------------------------
+// =============================================================================
+// do_expire_pass — internal: scan and remove expired keys, write WAL DELs
+// =============================================================================
+//
+// MUST be called under the exclusive lock.
+// Returns the number of keys expired.
+
+std::size_t KeyValueStore::do_expire_pass()
+{
+    const std::uint64_t now = current_time_us();
+    const auto expired_keys = storage_->expire_keys(now);
+
+    for (const auto& key : expired_keys) {
+        // Write WAL DEL so the expiration survives a restart.
+        try {
+            wal_->append_del(key);
+        } catch (const std::exception& e) {
+            std::cerr << "[ForgeKV] WARNING: cleanup WAL write failed for key '"
+                      << key << "': " << e.what() << "\n";
+        }
+    }
+
+    return expired_keys.size();
+}
+
+// =============================================================================
+// run_cleanup_now — trigger immediate cleanup (for tests / manual use)
+// =============================================================================
+
+void KeyValueStore::run_cleanup_now()
+{
+    std::unique_lock lock(mutex_);
+    (void)do_expire_pass();
+}
+
+// =============================================================================
+// set — permanent upsert
+// =============================================================================
+
 void KeyValueStore::set(const std::string& key, const std::string& value)
 {
     std::unique_lock lock(mutex_);
@@ -191,21 +368,48 @@ void KeyValueStore::set(const std::string& key, const std::string& value)
     storage_->set(key, value);
 }
 
-// -----------------------------------------------------------------------------
-// get
-// -----------------------------------------------------------------------------
+// =============================================================================
+// set_with_ttl — expiring upsert
+// =============================================================================
+
+void KeyValueStore::set_with_ttl(const std::string& key,
+                                  const std::string& value,
+                                  double             ttl_seconds)
+{
+    // ttl <= 0: key is immediately expired — do not store it.
+    if (ttl_seconds <= 0.0) {
+        return;
+    }
+
+    // Compute absolute expiration timestamp.
+    const std::uint64_t now = current_time_us();
+    const auto ttl_us = static_cast<std::uint64_t>(ttl_seconds * 1'000'000.0);
+    const std::uint64_t expires_at_us = now + ttl_us;
+
+    std::unique_lock lock(mutex_);
+    wal_->append_set_with_expiry(key, value, expires_at_us);
+    storage_->set_with_expiry(key, value, expires_at_us);
+}
+
+// =============================================================================
+// get — return value for non-expired key
+// =============================================================================
+
 std::optional<std::string> KeyValueStore::get(const std::string& key) const
 {
     std::shared_lock lock(mutex_);
     return storage_->get(key);
 }
 
-// -----------------------------------------------------------------------------
-// del
-// -----------------------------------------------------------------------------
+// =============================================================================
+// del — delete key (including any TTL)
+// =============================================================================
+
 bool KeyValueStore::del(const std::string& key)
 {
     std::unique_lock lock(mutex_);
+    // exists() returns false for expired keys — consistent with treating
+    // expired keys as logically non-existent.
     if (!storage_->exists(key)) {
         return false;
     }
@@ -214,36 +418,71 @@ bool KeyValueStore::del(const std::string& key)
     return true;
 }
 
-// -----------------------------------------------------------------------------
-// exists
-// -----------------------------------------------------------------------------
+// =============================================================================
+// exists — returns false for expired keys
+// =============================================================================
+
 bool KeyValueStore::exists(const std::string& key) const
 {
     std::shared_lock lock(mutex_);
     return storage_->exists(key);
 }
 
-// -----------------------------------------------------------------------------
-// size
-// -----------------------------------------------------------------------------
+// =============================================================================
+// ttl — query remaining TTL
+// =============================================================================
+
+double KeyValueStore::ttl(const std::string& key) const
+{
+    std::shared_lock lock(mutex_);
+    const auto entry = storage_->get_entry(key);
+    if (!entry.has_value()) {
+        return kTtlNotFound;
+    }
+
+    const StoreEntry& e = entry.value();
+
+    // Permanent key (no TTL).
+    if (!e.has_expiry()) {
+        return kTtlPermanent;
+    }
+
+    // Expiring key.
+    const std::uint64_t now = current_time_us();
+    if (e.expires_at_us <= now) {
+        // Already expired — behaves as not found.
+        return kTtlNotFound;
+    }
+
+    const double remaining_us =
+        static_cast<double>(e.expires_at_us - now);
+    return remaining_us / 1'000'000.0; // convert to seconds
+}
+
+// =============================================================================
+// size — count of live (non-expired) keys
+// =============================================================================
+
 std::size_t KeyValueStore::size() const
 {
     std::shared_lock lock(mutex_);
     return storage_->size();
 }
 
-// -----------------------------------------------------------------------------
-// empty
-// -----------------------------------------------------------------------------
+// =============================================================================
+// empty — true if no live keys
+// =============================================================================
+
 bool KeyValueStore::empty() const
 {
     std::shared_lock lock(mutex_);
     return storage_->empty();
 }
 
-// -----------------------------------------------------------------------------
-// clear
-// -----------------------------------------------------------------------------
+// =============================================================================
+// clear — remove all keys
+// =============================================================================
+
 void KeyValueStore::clear()
 {
     std::unique_lock lock(mutex_);
@@ -251,36 +490,35 @@ void KeyValueStore::clear()
     storage_->clear();
 }
 
-// -----------------------------------------------------------------------------
-// compact
-// -----------------------------------------------------------------------------
+// =============================================================================
+// compact — rewrite WAL with only live state
+// =============================================================================
 //
-// Stage 9 addition: before calling wal_->rewrite(), remove any existing
-// snapshot.  Compaction rewrites the WAL from offset 0.  A snapshot created
-// before compaction stores a wal_offset into the OLD WAL's byte layout.
-// After rewrite(), that offset is meaningless and would cause incorrect
-// recovery (either seeking to the wrong position or past EOF).
-//
-// By deleting the snapshot first, we guarantee that:
-//   - The compacted WAL is the sole source of truth for the next recovery.
-//   - Recovery after compaction always uses full WAL replay (from offset 0),
-//     which is correct because the compacted WAL already contains the full
-//     current state.
-//   - A new snapshot() call after compact() produces a snapshot that correctly
-//     points into the new compacted WAL.
+// Stage 10 changes:
+//   - Uses get_all_with_expiry() to get live entries WITH expiry metadata.
+//   - Writes SET_WITH_EXPIRY for expiring keys, SET for permanent keys.
+//   - Expired keys are automatically excluded (get_all_with_expiry filters them).
+
 void KeyValueStore::compact()
 {
     std::unique_lock lock(mutex_);
 
-    // 1. Capture the complete current state.
-    auto snap = storage_->get_all();
+    // 1. Get live state with expiry metadata. now_us ensures expired are excluded.
+    const std::uint64_t now = current_time_us();
+    auto entries = storage_->get_all_with_expiry(now);
 
-    // 2. Sort by key for deterministic WAL record order.
-    std::sort(snap.begin(), snap.end(),
+    // 2. Sort by key for determinism.
+    std::sort(entries.begin(), entries.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    // 3. Delete any existing snapshot BEFORE rewriting the WAL.
-    //    A failure here is non-fatal (we warn and continue).
+    // 3. Build SnapshotEntry list for rewrite().
+    std::vector<WAL::SnapshotEntry> snap;
+    snap.reserve(entries.size());
+    for (const auto& [key, entry] : entries) {
+        snap.push_back(WAL::SnapshotEntry{key, entry.value, entry.expires_at_us});
+    }
+
+    // 4. Delete existing snapshot (stale after WAL rewrite).
     if (snapshot_manager_.exists()) {
         if (!snapshot_manager_.remove()) {
             std::cerr << "[ForgeKV] WARNING: compact() could not remove "
@@ -289,33 +527,31 @@ void KeyValueStore::compact()
         }
     }
 
-    // 4. Delegate to WAL: write temp file, atomic rename, reopen stream.
+    // 5. Rewrite WAL atomically.
     wal_->rewrite(snap);
 }
 
-// -----------------------------------------------------------------------------
-// snapshot
-// -----------------------------------------------------------------------------
+// =============================================================================
+// snapshot — checkpoint full state to disk
+// =============================================================================
 //
-// Create a full-state checkpoint under the exclusive lock.
-//
-// The exclusive lock ensures that no SET/DEL/CLEAR can run between the state
-// capture (storage_->get_all()) and the WAL offset query (wal_->file_size()).
-// Both steps see the same consistent logical state.
+// Stage 10 changes:
+//   - Uses get_all_with_expiry() — excludes expired keys.
+//   - Passes StoreEntry records to SnapshotManager::save() (v2 format).
+
 bool KeyValueStore::snapshot()
 {
     try {
         std::unique_lock lock(mutex_);
 
-        // 1. Capture the complete current state.
-        auto records = storage_->get_all();
+        // 1. Capture live state with expiry metadata.
+        const std::uint64_t now = current_time_us();
+        auto records = storage_->get_all_with_expiry(now);
 
-        // 2. Capture the WAL boundary (current end-of-file position).
-        //    This is the offset past which future WAL records will be written.
-        //    Recovery must replay only records at or after this offset.
+        // 2. Capture WAL boundary.
         const std::uint64_t wal_offset = wal_->file_size();
 
-        // 3. Write the snapshot atomically.
+        // 3. Write snapshot v2.
         snapshot_manager_.save(wal_offset, records);
 
         return true;

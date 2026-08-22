@@ -137,6 +137,8 @@
 //
 // =============================================================================
 
+#include "forgekv/storage.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -154,8 +156,12 @@ namespace forgekv {
 // Bytes on disk: 0x4E, 0x53, 0x4B, 0x46 ('N','S','K','F').
 inline constexpr std::uint32_t kSnapshotMagic   = 0x464B534Eu;
 
-// Current snapshot format version.
-inline constexpr std::uint8_t  kSnapshotVersion = 0x01u;
+// Snapshot format versions.
+// Version 0x01: Stage 9 format — no expiry metadata.
+// Version 0x02: Stage 10 format — each record has a has_expiry flag and
+//               optional expires_at_us field.
+inline constexpr std::uint8_t  kSnapshotVersion   = 0x01u;  // legacy (Stage 9)
+inline constexpr std::uint8_t  kSnapshotVersionV2 = 0x02u;  // Stage 10
 
 // Fixed header size: magic(4) + version(1) + wal_offset(8) + count(4) = 17 bytes.
 inline constexpr std::size_t   kSnapshotHeaderSize = 17u;
@@ -164,12 +170,37 @@ inline constexpr std::size_t   kSnapshotHeaderSize = 17u;
 inline constexpr std::size_t   kSnapshotChecksumSize = 4u;
 
 // =============================================================================
+// Stage 10: Snapshot format v2 per-record layout
+// =============================================================================
+//
+// Each record in v2 extends the v1 layout:
+//
+//   v1 record: [key_len(4)] [key] [val_len(4)] [val]
+//
+//   v2 record: [key_len(4)] [key] [val_len(4)] [val]
+//              [has_expiry(1)] [expires_at_us(8)] ← only if has_expiry == 1
+//
+// has_expiry:  0x00 = permanent, 0x01 = has expiration timestamp.
+// expires_at_us: microseconds since Unix epoch (little-endian uint64_t).
+//                Only present in the byte stream when has_expiry == 0x01.
+//
+// Backward compatibility:
+//   - Writing: always write v2.
+//   - Loading: v1 snapshots are read as permanent entries (has_expiry = 0).
+//     v2 snapshots decode has_expiry + expires_at_us for each record.
+// =============================================================================
+
+// =============================================================================
 // SnapshotData — in-memory representation of a loaded snapshot
 // =============================================================================
 
 struct SnapshotData {
     std::uint64_t wal_offset{0};   // WAL byte boundary: replay from here
-    std::vector<std::pair<std::string, std::string>> records; // key-value pairs
+
+    // Stage 10: records now carry full StoreEntry data (value + expiry).
+    // For snapshots loaded from v1 (Stage 9) format, entries are permanent
+    // (expires_at_us == 0).
+    std::vector<std::pair<std::string, StoreEntry>> records;
 };
 
 // =============================================================================
@@ -209,14 +240,18 @@ public:
     // Parameters:
     //   wal_offset — the WAL byte offset at the time of the snapshot.
     //                Recovery will replay WAL records starting from this offset.
-    //   records    — all live key-value pairs at the time of snapshot.
+    //   records    — all live key-StoreEntry pairs at the time of snapshot.
+    //                Expired entries must be excluded by the caller.
+    //                StoreEntry carries both the value and expiry metadata.
+    //
+    // Format written: v2 (kSnapshotVersionV2) with has_expiry flag per record.
     //
     // Throws std::runtime_error if:
     //   - The temporary file cannot be created.
     //   - Any write or flush fails.
     //   - The atomic rename fails.
     void save(std::uint64_t wal_offset,
-              const std::vector<std::pair<std::string, std::string>>& records);
+              const std::vector<std::pair<std::string, StoreEntry>>& records);
 
     // -------------------------------------------------------------------------
     // SnapshotLoadResult — returned by load()

@@ -149,9 +149,42 @@ inline constexpr std::uint32_t kWalMagic   = 0x464B5741u;
 inline constexpr std::uint8_t  kWalVersion = 0x01u;
 
 // Operation codes for WAL records.
-inline constexpr std::uint8_t  kOpSet      = 0x01u;  // SET key value
-inline constexpr std::uint8_t  kOpDel      = 0x02u;  // DEL key
-inline constexpr std::uint8_t  kOpClear    = 0x03u;  // CLEAR (no key/value)
+inline constexpr std::uint8_t  kOpSet              = 0x01u;  // SET key value (permanent)
+inline constexpr std::uint8_t  kOpDel              = 0x02u;  // DEL key
+inline constexpr std::uint8_t  kOpClear            = 0x03u;  // CLEAR (no key/value)
+inline constexpr std::uint8_t  kOpSetWithExpiry    = 0x04u;  // SET key value expires_at
+
+// =============================================================================
+// Stage 10: kOpSetWithExpiry record layout
+// =============================================================================
+//
+// The SET_WITH_EXPIRY record extends the basic SET layout by appending an
+// 8-byte absolute expiration timestamp after the value payload but BEFORE the
+// CRC32 checksum.
+//
+//  Offset  Size  Type       Field
+//  ------  ----  ---------  -----------------------------------------------
+//       0     4  uint32_t   Magic number  (0x464B5741)
+//       4     1  uint8_t    Format version (0x01)
+//       5     1  uint8_t    Operation code (SET_WITH_EXPIRY = 0x04)
+//       6     4  uint32_t   Key length in bytes (little-endian)
+//      10     4  uint32_t   Value length in bytes (little-endian)
+//      14     ?  bytes      Key bytes   (key_len bytes)
+//   14+K      ?  bytes      Value bytes (val_len bytes)
+//   14+K+V    8  uint64_t   Absolute expiration time in microseconds since
+//                           Unix epoch (little-endian, UTC wall clock)
+//   14+K+V+8  4  uint32_t   CRC32 checksum (covers ALL preceding bytes)
+//
+// The expires_at field stores microseconds since Unix epoch (1970-01-01T00:00:00Z).
+// Using microseconds gives sub-millisecond precision while fitting in uint64_t.
+// Wall-clock time (system_clock) is used — NOT monotonic clock — because the
+// value must be meaningful across process restarts.
+//
+// Old WAL files (pre-Stage 10) contain only SET, DEL, CLEAR records (opcodes
+// 0x01-0x03). Recovery handles them as permanent (non-expiring) keys.
+// The kOpSetWithExpiry opcode (0x04) is new and was never written before
+// Stage 10, ensuring full backward compatibility.
+// =============================================================================
 
 // Fixed header size in bytes: magic(4) + version(1) + opcode(1) + key_len(4)
 //                                      + val_len(4) = 14 bytes.
@@ -160,14 +193,22 @@ inline constexpr std::size_t   kWalHeaderSize     = 14u;
 // Size of the trailing CRC32 checksum field.
 inline constexpr std::size_t   kWalChecksumSize   = 4u;
 
+// Size of the expires_at field appended for kOpSetWithExpiry records.
+inline constexpr std::size_t   kWalExpirySize     = 8u;
+
 // =============================================================================
 // WalRecord — decoded, validated record returned by read_record()
 // =============================================================================
 
 struct WalRecord {
-    std::uint8_t  opcode;   // kOpSet, kOpDel, or kOpClear
+    std::uint8_t  opcode;   // kOpSet, kOpDel, kOpClear, or kOpSetWithExpiry
     std::string   key;      // Key bytes (empty for CLEAR)
     std::string   value;    // Value bytes (empty for DEL and CLEAR)
+
+    // Stage 10: expiration timestamp (only valid when opcode == kOpSetWithExpiry).
+    // Stored as microseconds since Unix epoch (UTC wall-clock time).
+    // Zero when opcode is not kOpSetWithExpiry.
+    std::uint64_t expires_at_us{0};
 };
 
 // =============================================================================
@@ -216,6 +257,14 @@ public:
     // Record layout: header [magic|version|CLEAR|0|0] + CRC32.
     // Throws std::runtime_error if the write or flush fails.
     void append_clear();
+
+    // Stage 10: Append a SET_WITH_EXPIRY record.
+    // expires_at_us is microseconds since Unix epoch (UTC wall-clock).
+    // Record layout: header + key + value + expires_at_us(8 bytes) + CRC32.
+    // Throws std::runtime_error if the write or flush fails.
+    void append_set_with_expiry(const std::string& key,
+                                const std::string& value,
+                                std::uint64_t      expires_at_us);
 
     // -------------------------------------------------------------------------
     // Validation / read
@@ -389,7 +438,18 @@ public:
     //   - Any write or flush to the temporary file fails.
     //   - std::filesystem::rename() fails (original WAL preserved).
     //   - Reopening stream_ on the new WAL file fails.
-    void rewrite(const std::vector<std::pair<std::string, std::string>>& snapshot);
+    //
+    // Stage 10: Each SnapshotEntry carries an optional expires_at_us value.
+    // When expires_at_us == 0, a permanent SET record is written.
+    // When expires_at_us != 0, a SET_WITH_EXPIRY record is written.
+    // Expired entries (expires_at_us <= now) are excluded from the snapshot
+    // by the caller (KeyValueStore::compact()); rewrite() trusts the input.
+    struct SnapshotEntry {
+        std::string   key;
+        std::string   value;
+        std::uint64_t expires_at_us{0}; // 0 = permanent
+    };
+    void rewrite(const std::vector<SnapshotEntry>& snapshot);
 
     // -------------------------------------------------------------------------
     // Accessors
@@ -409,6 +469,9 @@ private:
     // Encode a uint8_t as 1 byte, appended to buf.
     static void encode_u8(std::vector<std::uint8_t>& buf, std::uint8_t v);
 
+    // Encode a uint64_t as 8 bytes, little-endian, appended to buf.
+    static void encode_u64(std::vector<std::uint8_t>& buf, std::uint64_t v);
+
     // -------------------------------------------------------------------------
     // CRC32
     // -------------------------------------------------------------------------
@@ -424,12 +487,16 @@ private:
 
     // Serialise and write one complete WAL record to stream_.
     // Computes the checksum over the header + payload bytes, then writes
-    // header + payload + checksum as a single binary blob.
+    // header + payload + [expires_at_us?] + checksum as a single binary blob.
     // Flushes after every write.
+    // For kOpSetWithExpiry: expires_at_us is encoded as 8 bytes LE after
+    // the value payload and before the checksum.
+    // For other opcodes: expires_at_us is ignored (pass 0).
     // Throws std::runtime_error if the write or flush fails.
     void write_record(std::uint8_t opcode,
                       const std::string& key,
-                      const std::string& value);
+                      const std::string& value,
+                      std::uint64_t expires_at_us);
 
     // -------------------------------------------------------------------------
     // State

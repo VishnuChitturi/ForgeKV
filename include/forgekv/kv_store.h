@@ -1,99 +1,72 @@
 #pragma once
 // =============================================================================
-// ForgeKV — Stage 7: KeyValueStore (Concurrency / Thread Safety)
+// ForgeKV — Stage 10: KeyValueStore (TTL / Expiration)
 // =============================================================================
 //
-// KeyValueStore is the public-facing engine of ForgeKV. It maps string keys to
-// string values and exposes the same API as Stage 1.
+// Stage 10 adds:
 //
-// Stage 1: KeyValueStore owned an unordered_map directly.
-// Stage 2: KeyValueStore owns a std::unique_ptr<Storage> and delegates all
-//          storage operations through the interface.
-// Stage 3: KeyValueStore also owns a std::unique_ptr<WAL>. Every mutating
-//          operation writes a WAL record BEFORE touching in-memory storage.
-//          The Stage 3 WAL used a human-readable text format.
-// Stage 4: The WAL now uses a structured binary format with CRC32 checksums.
-//          Keys and values are stored with explicit byte lengths, so any byte
-//          sequence (including '|', '\n', '\r', spaces) is handled correctly.
-//          The KeyValueStore API and write-ordering invariants are unchanged.
-// Stage 5: On construction, KeyValueStore replays the existing WAL into
-//          Storage, reconstructing the key-value state from before the last
-//          shutdown.  All three constructors perform recovery automatically.
-//          Recovery does NOT write new WAL records.  After recovery, normal
-//          mutations continue appending to the existing WAL.
-// Stage 7: KeyValueStore is now thread-safe via a std::shared_mutex (mutex_).
+//   1. set_with_ttl(key, value, ttl_seconds) — set a key with an optional
+//      time-to-live in seconds.  The absolute expiration timestamp is stored
+//      internally as microseconds since Unix epoch (wall clock).
 //
-//          Locking model:
+//   2. ttl(key) — query the remaining TTL for a key.
+//      Returns:
+//        > 0  — seconds remaining (fractional)
+//        0.0  — key is expired (or will expire imminently)
+//       -1.0  — key exists but is permanent (no TTL set)
+//       -2.0  — key does not exist (or has already expired and been removed)
 //
-//          READ operations (get, exists, size, empty):
-//            Acquire std::shared_lock<std::shared_mutex> — multiple readers
-//            may hold the lock simultaneously.
+//   3. Background cleanup thread — periodically removes expired keys from
+//      in-memory storage and writes WAL DEL records so expiration is durable.
+//      The thread wakes every cleanup_interval_ms milliseconds or immediately
+//      on shutdown.  It is joined in the destructor.
 //
-//          WRITE operations (set, del, clear):
-//            Acquire std::unique_lock<std::shared_mutex> — exactly one writer
-//            holds the lock; all readers and other writers are excluded.
+//   4. Destructor cleanup — the destructor signals the cleanup thread to stop
+//      and joins it before destroying WAL/storage.
 //
-//          The mutex_ is acquired for the FULL duration of each public
-//          operation (both the WAL write and the storage mutation), so that
-//          a write is atomic from the perspective of other threads. There is
-//          no intermediate visible state where the WAL has been written but
-//          the in-memory store has not yet been updated.
+// TTL semantics:
 //
-//          InMemoryStorage does NOT have its own mutex. All access to
-//          storage_ is mediated through KeyValueStore which already holds the
-//          appropriate lock before calling into it.
+//   - set(key, value)               → permanent; removes any prior TTL.
+//   - set_with_ttl(key, value, ttl) → sets expiry = now + ttl.
+//   - ttl <= 0                      → key is immediately expired/not stored.
+//   - Updating a key with set()     → clears the TTL; key becomes permanent.
+//   - Updating with set_with_ttl()  → replaces the expiry with new value.
 //
-//          WAL is likewise not independently synchronized. The WAL's
-//          ofstream is only written under the exclusive lock held by the
-//          write operations, so no two concurrent writers can interleave
-//          WAL records.
+// Read-time expiration (safe with shared_mutex):
 //
-// Architecture (Stage 7):
+//   get() and exists() use Storage::get/exists which check the current time
+//   and return "absent" for expired keys WITHOUT mutating storage.
+//   Physical removal only happens under exclusive lock (background thread or
+//   write operations that encounter an expired key).
 //
-//                   KeyValueStore  ← public thread-safe boundary
-//                  /     |       \
-//                 /      |        \
-//                v       v         v
-//            Storage  Recovery    WAL
-//                |       |         |
-//                v       v         v
-//        InMemoryStorage  ←  forgekv.wal (binary)
+// Background cleanup and WAL durability:
 //
-// Startup sequence:
+//   When the background thread removes expired keys, it:
+//   1. Acquires the exclusive lock.
+//   2. Calls storage_->expire_keys(now_us) to remove expired entries.
+//   3. For each removed key, calls wal_->append_del(key) to write a WAL
+//      DEL record.  This ensures that a restart will NOT resurrect the key.
+//   4. Releases the lock.
 //
-//   1. Construct Storage (empty).
-//   2. Open WAL (append mode — existing content preserved).
-//   3. Recovery::run() replays WAL records into Storage.
-//   4. Store is ready for normal, thread-safe operation.
+// Concurrency model (unchanged from Stage 7):
 //
-// Write ordering (unchanged from Stage 4):
+//   READ operations (get, exists, size, empty, ttl):
+//     → shared_lock (multiple concurrent readers)
 //
-//   KeyValueStore::set()   → [exclusive lock] → WAL::append_set()   → Storage::set()
-//   KeyValueStore::del()   → [exclusive lock] → WAL::append_del()   → Storage::del()
-//   KeyValueStore::clear() → [exclusive lock] → WAL::append_clear() → Storage::clear()
+//   WRITE operations (set, set_with_ttl, del, clear, compact, snapshot):
+//     → exclusive lock (single writer, all readers blocked)
 //
-// Recovery ordering (does NOT write to WAL):
+//   Background cleanup:
+//     → exclusive lock (short critical section per cleanup cycle)
 //
-//   WAL::replay() → Recovery::run() → Storage::set/del/clear()
-//   (Recovery runs in the constructor, before the store is exposed to threads.)
+// Thread lifecycle:
 //
-// Recovery failure:
+//   The cleanup thread is started in the constructor (after recover()).
+//   It runs until stop_cleanup_ is set.
+//   The destructor: sets stop_cleanup_, notifies the condition variable,
+//   joins the thread. The WAL and storage are destroyed AFTER the thread
+//   has exited, so there is no use-after-free risk.
 //
-//   If the WAL contains a corrupted complete record (bad magic, version,
-//   opcode, or checksum mismatch), or a truncated record that is NOT the
-//   final entry, the constructor throws std::runtime_error.  The store
-//   must not be used after a constructor throw.
-//
-//   A truncated FINAL record (common after a crash mid-write) is treated
-//   as non-fatal: all prior complete records are replayed and the store
-//   starts normally.
-//
-// New WAL file / empty WAL:
-//
-//   If the WAL file does not exist or is empty, recovery is a no-op.
-//   The store starts with an empty Storage, as before Stage 5.
-//
-// Thread safety: THREAD-SAFE as of Stage 7 via std::shared_mutex.
 // =============================================================================
 
 #include "forgekv/recovery.h"
@@ -101,12 +74,31 @@
 #include "forgekv/storage.h"
 #include "forgekv/wal.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 
 namespace forgekv {
+
+// =============================================================================
+// TTL query result constants (returned by ttl())
+// =============================================================================
+
+// Returned by ttl() when the key exists and is permanent (no TTL set).
+inline constexpr double kTtlPermanent = -1.0;
+
+// Returned by ttl() when the key does not exist or has already expired.
+inline constexpr double kTtlNotFound  = -2.0;
+
+// =============================================================================
+// KeyValueStore
+// =============================================================================
 
 class KeyValueStore {
 public:
@@ -114,179 +106,176 @@ public:
     // Construction
     // -------------------------------------------------------------------------
 
+    // Default cleanup interval: 1 second.
+    static constexpr std::chrono::milliseconds kDefaultCleanupInterval{1000};
+
     // Default constructor — creates InMemoryStorage and opens WAL at
     // "forgekv.wal" in the current working directory.  Performs WAL replay
     // into Storage before the store is ready for use.
-    // Throws std::runtime_error if the WAL file cannot be opened or if
-    // recovery encounters unrecoverable corruption.
     KeyValueStore();
 
     // Full dependency-injection constructor — accepts any Storage and WAL.
-    // Takes ownership of both pointers.  Performs WAL replay into Storage.
-    // Throws std::invalid_argument if storage or wal is null.
-    // Throws std::runtime_error if recovery fails.
     explicit KeyValueStore(std::unique_ptr<Storage> storage,
                            std::unique_ptr<WAL>     wal);
 
-    // Storage-only injection (convenience overload) — creates a default WAL
-    // at "forgekv.wal". Kept for backward compatibility with Stage 2 tests
-    // that inject only a Storage.  Performs WAL replay into Storage.
+    // Storage-only injection (convenience overload).
     explicit KeyValueStore(std::unique_ptr<Storage> storage);
 
-    ~KeyValueStore() = default;
+    // Destructor: stops and joins the cleanup thread before destroying
+    // WAL and storage.  MUST be called before the WAL file or storage
+    // objects go out of scope.
+    ~KeyValueStore();
 
-    // Not copyable. Movable via custom move constructor.
-    //
-    // std::shared_mutex is non-movable, so the default-generated move
-    // constructor is deleted by the compiler. We provide an explicit move
-    // constructor that moves storage_ and wal_ and default-constructs a new
-    // mutex_ for the moved-to object (the moved-from mutex state is irrelevant
-    // because the moved-from store must not be used after a move).
+    // Not copyable.
     KeyValueStore(const KeyValueStore&)            = delete;
     KeyValueStore& operator=(const KeyValueStore&) = delete;
 
+    // Movable.
     KeyValueStore(KeyValueStore&& other) noexcept;
     KeyValueStore& operator=(KeyValueStore&&) = delete;
 
     // -------------------------------------------------------------------------
-    // Core operations
+    // Core operations (Stage 2 API — unchanged)
     // -------------------------------------------------------------------------
 
-    // SET: WAL append_set, then Storage::set. Upsert semantics.
-    // Throws std::runtime_error if the WAL write fails (in-memory unchanged).
+    // SET: WAL append_set (permanent), then Storage::set.  Removes any TTL.
     void set(const std::string& key, const std::string& value);
 
-    // GET: Storage::get only. No WAL interaction.
+    // GET: Storage::get only.  Returns nullopt for missing or expired keys.
     [[nodiscard]] std::optional<std::string> get(const std::string& key) const;
 
-    // DEL: If key exists: WAL append_del, then Storage::del. Returns true.
-    //      If key does not exist: returns false. No WAL record is written.
-    // Throws std::runtime_error if the WAL write fails (in-memory unchanged).
+    // DEL: WAL append_del + Storage::del if key exists. Returns true if found.
     bool del(const std::string& key);
 
-    // EXISTS: Storage::exists only. No WAL interaction.
+    // EXISTS: Storage::exists.  Returns false for expired keys.
     [[nodiscard]] bool exists(const std::string& key) const;
 
-    // -------------------------------------------------------------------------
-    // Utility
-    // -------------------------------------------------------------------------
-
-    // SIZE: Storage::size only. No WAL interaction.
+    // SIZE: Returns the count of live (non-expired) keys.
     [[nodiscard]] std::size_t size() const;
 
-    // EMPTY: Storage::empty only. No WAL interaction.
+    // EMPTY: Returns true if no live keys exist.
     [[nodiscard]] bool empty() const;
 
-    // CLEAR: WAL append_clear, then Storage::clear.
-    // Throws std::runtime_error if the WAL write fails (in-memory unchanged).
+    // CLEAR: WAL append_clear + Storage::clear.
     void clear();
+
+    // -------------------------------------------------------------------------
+    // Stage 10: TTL API
+    // -------------------------------------------------------------------------
+
+    // SET_WITH_TTL: Store key with a time-to-live in seconds.
+    //
+    // ttl_seconds: duration in seconds until the key expires.
+    //              Must be > 0.  If ttl_seconds <= 0, the key is NOT stored
+    //              (it is considered immediately expired) and the function
+    //              returns without writing to WAL or storage.
+    //
+    // The absolute expiration timestamp is computed as:
+    //   expires_at = system_clock::now() + duration(ttl_seconds)
+    // and stored as microseconds since Unix epoch.
+    //
+    // If the key already exists (with or without TTL), the value and
+    // expiration are both replaced atomically.
+    //
+    // Throws std::runtime_error if the WAL write fails.
+    void set_with_ttl(const std::string& key,
+                      const std::string& value,
+                      double             ttl_seconds);
+
+    // TTL: Query the remaining time-to-live for a key.
+    //
+    // Returns:
+    //   kTtlPermanent (-1.0) — key exists and is permanent (no TTL).
+    //   kTtlNotFound  (-2.0) — key does not exist or has already expired.
+    //   >= 0.0               — seconds remaining until expiration (may be 0
+    //                          if expiring imminently but not yet cleaned up).
+    [[nodiscard]] double ttl(const std::string& key) const;
 
     // -------------------------------------------------------------------------
     // Stage 8: Log Compaction
     // -------------------------------------------------------------------------
 
     // COMPACT: Rewrite the WAL to contain only the current live state.
-    //
-    // This eliminates all historical, redundant, and obsolete records from the
-    // WAL, reducing both its file size and future recovery time.
-    //
-    // Compaction is a write operation that holds the exclusive lock for its
-    // entire duration, ensuring that:
-    //   - No concurrent SET/DELETE/CLEAR can modify the state mid-compaction.
-    //   - No concurrent WAL append can interleave with the atomic file replace.
-    //   - Readers cannot observe an inconsistent intermediate state.
-    //
-    // The resulting compacted WAL contains exactly one SET record per live key.
-    // Keys that have been deleted are not written.
-    // Records are written in lexicographic key order for determinism.
-    //
-    // After compaction, the store's in-memory state is unchanged and the WAL
-    // stream points to the new, compacted file.  Subsequent SET/DELETE/CLEAR
-    // operations append to the compacted WAL normally.
-    //
-    // Stage 9 note: compact() DELETES the snapshot file (if present) before
-    // rewriting the WAL.  This prevents a stale snapshot from pointing to a
-    // WAL offset that no longer exists in the newly written compacted WAL.
-    //
-    // Throws std::runtime_error if the compaction fails (e.g., temp file
-    // cannot be created, rename fails, or WAL reopen fails).  On failure
-    // before the rename, the original WAL is preserved intact.
+    // Expired keys are excluded.  Expiring-but-live keys are preserved with
+    // their SET_WITH_EXPIRY records.
+    // Stage 9 note: compact() DELETES the snapshot file before rewriting.
     void compact();
 
     // -------------------------------------------------------------------------
     // Stage 9: Snapshots
     // -------------------------------------------------------------------------
 
-    // SNAPSHOT: Create a full-state checkpoint and save it to disk atomically.
-    //
-    // A snapshot records:
-    //   - All live key-value pairs at the moment of creation.
-    //   - The WAL byte offset at the moment of creation.
-    //
-    // On subsequent startup, recovery will:
-    //   1. Load the snapshot (restore in-memory state from saved pairs).
-    //   2. Replay only WAL records written AFTER the snapshot (from the saved
-    //      offset onward).
-    //
-    // This reduces recovery time: instead of replaying the full WAL history,
-    // only the tail needs to be processed.
-    //
-    // Locking:
-    //   snapshot() acquires the EXCLUSIVE lock for its entire duration.
-    //   This guarantees that the captured state and the WAL offset represent
-    //   the SAME logical point in time — no concurrent write can interleave
-    //   between the state capture and the offset query.
-    //
-    // Atomicity:
-    //   The snapshot file is written atomically via a temp-then-rename strategy.
-    //   If writing fails before the rename, any existing snapshot is preserved.
-    //
-    // Returns true on success, false if snapshot creation failed.
-    // Does not throw (all errors are logged/suppressed internally and the
-    // store remains fully operational on snapshot failure).
+    // SNAPSHOT: Create a full-state checkpoint.
+    // Expired keys are excluded from the snapshot.
+    // Live expiring keys are stored with their expiry metadata.
+    // Returns true on success, false on failure.
     bool snapshot();
+
+    // -------------------------------------------------------------------------
+    // Stage 10: Cleanup control (primarily for testing)
+    // -------------------------------------------------------------------------
+
+    // Trigger an immediate cleanup cycle (synchronously, under exclusive lock).
+    // Useful in tests that need to flush expired keys without waiting for the
+    // background thread's next wakeup.
+    void run_cleanup_now();
 
 private:
     // -------------------------------------------------------------------------
     // Recovery helper
     // -------------------------------------------------------------------------
-
-    // Replay the WAL into storage_.  Called once from each constructor after
-    // both storage_ and wal_ are initialised.
-    //
-    // On success (clean WAL, empty WAL, or truncated-final-record):
-    //   returns normally.  storage_ contains the reconstructed state.
-    //
-    // On failure (corrupted record, mid-log truncation):
-    //   throws std::runtime_error.  The constructor propagates the exception
-    //   and the store must not be used.
     void recover();
+
+    // -------------------------------------------------------------------------
+    // Background cleanup
+    // -------------------------------------------------------------------------
+
+    // Entry point for the background cleanup thread.
+    // Runs until stop_cleanup_ is true.
+    void cleanup_worker();
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
+
+    // Perform a single cleanup pass: expire keys and write WAL DEL records.
+    // MUST be called under the exclusive lock (mutex_).
+    // Returns the number of keys expired.
+    std::size_t do_expire_pass();
 
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
 
-    // Reader/writer lock protecting storage_ and wal_ from concurrent access.
-    //
-    // Ownership model:
-    //   - Read operations (get, exists, size, empty) acquire a shared_lock,
-    //     allowing multiple concurrent readers.
-    //   - Write operations (set, del, clear) acquire a unique_lock, granting
-    //     exclusive access for the full duration of WAL write + storage mutation.
-    //
-    // mutex_ is declared mutable so that const read operations (get, exists,
-    // size, empty) can acquire a shared_lock without violating const-ness.
+    // Reader/writer lock protecting storage_ and wal_.
     mutable std::shared_mutex mutex_;
 
-    // Backing storage — owned exclusively. Never null after construction.
+    // Backing storage.
     std::unique_ptr<Storage> storage_;
 
-    // Write-ahead log — owned exclusively. Never null after construction.
+    // Write-ahead log.
     std::unique_ptr<WAL> wal_;
 
-    // Snapshot manager — manages the snapshot file at <wal_path>.snapshot.
-    // Constructed lazily from wal_->path() after wal_ is initialised.
+    // Snapshot manager.
     SnapshotManager snapshot_manager_;
+
+    // ---- Background cleanup thread ----
+
+    // Set to true before joining the thread.
+    std::atomic<bool> stop_cleanup_{false};
+
+    // Condition variable to wake the cleanup thread early (on shutdown or
+    // explicit trigger).  Uses a separate plain mutex (cleanup_cv_mutex_)
+    // because std::condition_variable requires std::unique_lock<std::mutex>.
+    mutable std::mutex              cleanup_cv_mutex_;
+    std::condition_variable         cleanup_cv_;
+
+    // Cleanup interval.
+    std::chrono::milliseconds cleanup_interval_{kDefaultCleanupInterval};
+
+    // The cleanup thread.  Joined in the destructor.
+    std::thread cleanup_thread_;
 };
 
 } // namespace forgekv
+

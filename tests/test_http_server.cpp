@@ -55,6 +55,7 @@
 #include "httplib.h"
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -671,6 +672,166 @@ TEST(s7_http_concurrent_mixed_put_get_delete) {
 
 // =============================================================================
 // Test runner
+// =============================================================================
+
+// =============================================================================
+// Stage 10 — HTTP TTL Tests (X-TTL-Seconds header)
+// =============================================================================
+//
+// H10-A. PUT without X-TTL-Seconds stores key permanently.
+// H10-B. PUT with valid X-TTL-Seconds stores key with TTL.
+// H10-C. GET of expired key returns 404.
+// H10-D. PUT with X-TTL-Seconds = 0 returns 400.
+// H10-E. PUT with negative X-TTL-Seconds returns 400.
+// H10-F. PUT with non-numeric X-TTL-Seconds returns 400.
+// H10-G. PUT with very large X-TTL-Seconds succeeds.
+// H10-H. Overwrite expiring key with normal PUT makes it permanent.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// H10-A. PUT without X-TTL-Seconds → permanent key.
+// ---------------------------------------------------------------------------
+TEST(h10_put_no_ttl_header_permanent) {
+    TempWAL wal("h10a");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    auto res = cli.Put("/key/mykey", "myvalue", "text/plain");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+
+    // Key should be permanent.
+    ASSERT_EQ(fix.store().ttl("mykey"), forgekv::kTtlPermanent);
+}
+
+// ---------------------------------------------------------------------------
+// H10-B. PUT with valid X-TTL-Seconds stores key with TTL.
+// ---------------------------------------------------------------------------
+TEST(h10_put_with_ttl_header_stores_ttl) {
+    TempWAL wal("h10b");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    httplib::Headers headers{{"X-TTL-Seconds", "60"}};
+    auto res = cli.Put("/key/session", headers, "token123", "text/plain");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+
+    // Key should have a TTL close to 60 seconds.
+    const double remaining = fix.store().ttl("session");
+    ASSERT_TRUE(remaining > 0.0 && remaining <= 60.0);
+}
+
+// ---------------------------------------------------------------------------
+// H10-C. GET of expired key returns 404.
+// ---------------------------------------------------------------------------
+TEST(h10_get_expired_key_returns_404) {
+    TempWAL wal("h10c");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    // Set a very short TTL via direct store call (10ms is too short for HTTP
+    // round-trip, so use the store directly).
+    fix.store().set_with_ttl("quick_exp", "val", 0.010);
+
+    // Wait for expiry.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    auto res = cli.Get("/key/quick_exp");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 404);
+}
+
+// ---------------------------------------------------------------------------
+// H10-D. PUT with X-TTL-Seconds = 0 returns 400.
+// ---------------------------------------------------------------------------
+TEST(h10_put_ttl_zero_returns_400) {
+    TempWAL wal("h10d");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    httplib::Headers headers{{"X-TTL-Seconds", "0"}};
+    auto res = cli.Put("/key/k", headers, "v", "text/plain");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 400);
+}
+
+// ---------------------------------------------------------------------------
+// H10-E. PUT with negative X-TTL-Seconds returns 400.
+// ---------------------------------------------------------------------------
+TEST(h10_put_negative_ttl_returns_400) {
+    TempWAL wal("h10e");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    httplib::Headers headers{{"X-TTL-Seconds", "-10"}};
+    auto res = cli.Put("/key/k", headers, "v", "text/plain");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 400);
+}
+
+// ---------------------------------------------------------------------------
+// H10-F. PUT with non-numeric X-TTL-Seconds returns 400.
+// ---------------------------------------------------------------------------
+TEST(h10_put_non_numeric_ttl_returns_400) {
+    TempWAL wal("h10f");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    httplib::Headers headers{{"X-TTL-Seconds", "abc"}};
+    auto res = cli.Put("/key/k", headers, "v", "text/plain");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 400);
+}
+
+// ---------------------------------------------------------------------------
+// H10-G. PUT with very large X-TTL-Seconds succeeds (no overflow).
+// ---------------------------------------------------------------------------
+TEST(h10_put_large_ttl_succeeds) {
+    TempWAL wal("h10g");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    httplib::Headers headers{{"X-TTL-Seconds", "86400"}};  // 1 day
+    auto res = cli.Put("/key/longkey", headers, "longval", "text/plain");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+
+    // Key should exist with a large TTL.
+    const double remaining = fix.store().ttl("longkey");
+    ASSERT_TRUE(remaining > 0.0 && remaining <= 86400.0);
+}
+
+// ---------------------------------------------------------------------------
+// H10-H. Overwrite expiring key with normal PUT makes it permanent.
+// ---------------------------------------------------------------------------
+TEST(h10_overwrite_expiring_with_normal_put) {
+    TempWAL wal("h10h");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    // First set with TTL.
+    httplib::Headers ttl_headers{{"X-TTL-Seconds", "5"}};
+    {
+        auto res = cli.Put("/key/key1", ttl_headers, "val1", "text/plain");
+        ASSERT_TRUE(res);
+        ASSERT_EQ(res->status, 200);
+    }
+    ASSERT_TRUE(fix.store().ttl("key1") > 0.0);
+
+    // Overwrite without TTL header.
+    {
+        auto res = cli.Put("/key/key1", "new_permanent_value", "text/plain");
+        ASSERT_TRUE(res);
+        ASSERT_EQ(res->status, 200);
+    }
+    // Now the key should be permanent.
+    ASSERT_EQ(fix.store().ttl("key1"), forgekv::kTtlPermanent);
+    ASSERT_EQ(*fix.store().get("key1"), "new_permanent_value");
+}
+
+// =============================================================================
+// End of Stage 10 HTTP tests
 // =============================================================================
 
 int main() {

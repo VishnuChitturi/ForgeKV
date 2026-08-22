@@ -59,6 +59,7 @@
 
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace forgekv {
 
@@ -181,6 +182,14 @@ void HttpServer::register_routes() {
     // Returns 400 if the body is empty.
     // Returns 200 + {"status":"ok"} on success.
     // Returns 500 on unexpected exception.
+    //
+    // Stage 10: Optional X-TTL-Seconds header.
+    //   If present and valid (integer or decimal > 0):
+    //     → store key with that TTL (set_with_ttl)
+    //   If absent:
+    //     → store permanently (set)
+    //   If present but invalid (non-numeric, <= 0):
+    //     → 400 Bad Request
     server_.Put("/key/:key", [this](const httplib::Request& req,
                                    httplib::Response&       res) {
         try {
@@ -194,7 +203,38 @@ void HttpServer::register_routes() {
                 return;
             }
 
-            store_.set(key, value);
+            // Check for optional X-TTL-Seconds header.
+            if (req.has_header("X-TTL-Seconds")) {
+                const std::string& ttl_str = req.get_header_value("X-TTL-Seconds");
+                double ttl_val = 0.0;
+                try {
+                    std::size_t pos = 0;
+                    ttl_val = std::stod(ttl_str, &pos);
+                    // Ensure the entire header value was consumed (no trailing junk).
+                    if (pos != ttl_str.size()) {
+                        throw std::invalid_argument("trailing characters");
+                    }
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(
+                        json_error("X-TTL-Seconds must be a positive number"),
+                        "application/json");
+                    return;
+                }
+
+                if (ttl_val <= 0.0) {
+                    res.status = 400;
+                    res.set_content(
+                        json_error("X-TTL-Seconds must be greater than 0"),
+                        "application/json");
+                    return;
+                }
+
+                store_.set_with_ttl(key, value, ttl_val);
+            } else {
+                store_.set(key, value);
+            }
+
             res.status = 200;
             res.set_content(json_status("ok"), "application/json");
         } catch (const std::exception&) {

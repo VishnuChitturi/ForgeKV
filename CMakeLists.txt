@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     ForgeKV
-    VERSION 0.9.0
+    VERSION 0.10.0
     DESCRIPTION "A persistent, concurrent key-value storage engine built from scratch in C++20"
     LANGUAGES CXX
 )

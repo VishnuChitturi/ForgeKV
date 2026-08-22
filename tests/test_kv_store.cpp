@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -380,6 +381,14 @@ public:
     std::vector<std::pair<std::string, std::string>> get_all() const override {
         return {};
     }
+    // Stage 10: TTL stubs (not exercised by these tests)
+    void set_with_expiry(const std::string&, const std::string&,
+                         std::uint64_t) override {}
+    std::optional<forgekv::StoreEntry>
+    get_entry(const std::string&) const override { return std::nullopt; }
+    std::vector<std::pair<std::string, forgekv::StoreEntry>>
+    get_all_with_expiry(std::uint64_t) const override { return {}; }
+    std::vector<std::string> expire_keys(std::uint64_t) override { return {}; }
 };
 
 // =============================================================================
@@ -2111,6 +2120,28 @@ public:
         for (const auto& [k, v] : data) { result.emplace_back(k, v); }
         return result;
     }
+    // Stage 10: TTL stubs
+    void set_with_expiry(const std::string& k, const std::string& v,
+                         std::uint64_t exp) override {
+        ops.push_back("SET_EXP:" + k + "=" + v);
+        data[k] = v;
+        (void)exp;
+    }
+    std::optional<forgekv::StoreEntry>
+    get_entry(const std::string& k) const override {
+        auto it = data.find(k);
+        if (it == data.end()) return std::nullopt;
+        return forgekv::StoreEntry(it->second);
+    }
+    std::vector<std::pair<std::string, forgekv::StoreEntry>>
+    get_all_with_expiry(std::uint64_t) const override {
+        std::vector<std::pair<std::string, forgekv::StoreEntry>> result;
+        for (const auto& [k, v] : data) {
+            result.emplace_back(k, forgekv::StoreEntry(v));
+        }
+        return result;
+    }
+    std::vector<std::string> expire_keys(std::uint64_t) override { return {}; }
 };
 
 TEST(s5_injected_storage_receives_recovery_ops) {
@@ -3940,7 +3971,8 @@ TEST(s9_snapshot_binary_format) {
     ASSERT_EQ(magic, forgekv::kSnapshotMagic);
 
     // Check version (byte 4).
-    ASSERT_EQ(raw[4], forgekv::kSnapshotVersion);
+    // Stage 10 writes version 0x02 (kSnapshotVersionV2) — backward compatible.
+    ASSERT_EQ(raw[4], forgekv::kSnapshotVersionV2);
 
     // Check record count (bytes 13..16).
     const std::uint32_t count =
@@ -3958,7 +3990,10 @@ TEST(s9_snapshot_binary_format) {
     ASSERT_EQ(result.data.records.size(), std::size_t{2});
 
     // Collect loaded keys.
-    std::vector<std::pair<std::string,std::string>> loaded = result.data.records;
+    std::vector<std::pair<std::string,std::string>> loaded;
+    for (const auto& [k, entry] : result.data.records) {
+        loaded.emplace_back(k, entry.value);
+    }
     std::sort(loaded.begin(), loaded.end());
     ASSERT_EQ(loaded[0].first,  "format_key");
     ASSERT_EQ(loaded[0].second, "format_val");
@@ -4204,6 +4239,889 @@ TEST(s9_snapshot_manager_remove) {
 
 // =============================================================================
 // Test runner
+// =============================================================================
+
+// =============================================================================
+// Stage 10 — TTL / Expiration Tests
+// =============================================================================
+//
+// Tests cover:
+//   S10-A.  Persistent key without TTL remains accessible.
+//   S10-B.  set_with_ttl stores an expiration.
+//   S10-C.  Key expires after TTL.
+//   S10-D.  Expired key behaves as missing (get returns nullopt).
+//   S10-E.  exists() returns false for expired key.
+//   S10-F.  ttl() reports remaining time correctly (>= 0).
+//   S10-G.  ttl() returns kTtlPermanent for permanent key.
+//   S10-H.  ttl() returns kTtlNotFound for missing key.
+//   S10-I.  ttl() returns kTtlNotFound for expired key.
+//   S10-J.  Normal set() removes previous TTL (key becomes permanent).
+//   S10-K.  Updating TTL with set_with_ttl replaces the previous expiry.
+//   S10-L.  del() on a key with TTL works.
+//   S10-M.  clear() removes TTL keys.
+//   S10-N.  ttl <= 0 causes key to not be stored (immediate expiry).
+//   S10-O.  Background cleanup removes expired keys.
+//   S10-P.  Background cleanup writes WAL DEL for durability.
+//   S10-Q.  Restart before expiration preserves key (WAL recovery).
+//   S10-R.  Restart after expiration does NOT resurrect key (WAL recovery).
+//   S10-S.  Snapshot preserves future expiration (set_with_ttl survives snap).
+//   S10-T.  Snapshot excludes already-expired entries.
+//   S10-U.  Recovery from snapshot + WAL tail preserves TTL.
+//   S10-V.  Compaction preserves TTL metadata for live keys.
+//   S10-W.  Compaction excludes expired keys.
+//   S10-X.  Old pre-TTL WAL (only SET/DEL/CLEAR records) recovers correctly.
+//   S10-Y.  WAL SET_WITH_EXPIRY record has correct binary layout.
+//   S10-Z.  Concurrent TTL cleanup with readers/writers (no deadlock/race).
+//   S10-AA. KeyValueStore destructor cleanly stops the cleanup thread.
+//   S10-AB. Multiple expiring keys with different deadlines.
+//   S10-AC. Large number of TTL keys (stress test).
+//   S10-AD. del() on expired key returns false (expired == not found).
+//   S10-AE. size() and empty() respect TTL.
+//   S10-AF. run_cleanup_now() forces immediate expiration pass.
+//   S10-AG. Snapshot v2 binary format: has_expiry flag is written.
+//   S10-AH. Snapshot v1 (Stage 9) loads as permanent entries (backward compat).
+//   S10-AI. TTL zero: set_with_ttl(key, val, 0.0) does not store the key.
+// =============================================================================
+
+#include "forgekv/snapshot.h"  // already included above, but safe to repeat
+
+// ---------------------------------------------------------------------------
+// Helpers for Stage 10 tests
+// ---------------------------------------------------------------------------
+
+// Helper: create a SnapGuard but under a different namespace to avoid duplicate
+// macro usage. We reuse the SnapGuard struct defined earlier.
+#define TEMP_TTL_SNAP(name)  SnapGuard name{"test_s10_" #name ".wal"}
+
+// Helper: wait with bounded retries until a condition is true.
+// Used to wait for background cleanup without long fixed sleeps.
+// Returns true if condition became true within the timeout.
+static bool wait_until(std::function<bool()> cond,
+                       std::chrono::milliseconds timeout =
+                           std::chrono::milliseconds{3000},
+                       std::chrono::milliseconds poll_interval =
+                           std::chrono::milliseconds{10})
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (cond()) return true;
+        std::this_thread::sleep_for(poll_interval);
+    }
+    return false;
+}
+
+// Helper: build a store with a very fast cleanup interval for testing.
+// The DI constructor accepts any WAL path; set cleanup interval by
+// using run_cleanup_now() explicitly.
+static forgekv::KeyValueStore make_ttl_store(const std::string& wal_path)
+{
+    return forgekv::KeyValueStore(
+        std::make_unique<forgekv::InMemoryStorage>(),
+        std::make_unique<forgekv::WAL>(wal_path));
+}
+
+// ---------------------------------------------------------------------------
+// S10-A. Persistent key without TTL remains accessible.
+// ---------------------------------------------------------------------------
+TEST(s10_persistent_key_no_ttl) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("persistent", "value");
+    ASSERT_HAS_VALUE(store.get("persistent"));
+    ASSERT_EQ(*store.get("persistent"), "value");
+    ASSERT_TRUE(store.exists("persistent"));
+    ASSERT_EQ(store.ttl("persistent"), forgekv::kTtlPermanent);
+}
+
+// ---------------------------------------------------------------------------
+// S10-B. set_with_ttl stores an expiration (key is accessible before expiry).
+// ---------------------------------------------------------------------------
+TEST(s10_set_with_ttl_stores_expiry) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("session", "abc123", 60.0); // 60 second TTL
+    ASSERT_HAS_VALUE(store.get("session"));
+    ASSERT_EQ(*store.get("session"), "abc123");
+    ASSERT_TRUE(store.exists("session"));
+    // TTL should be close to 60 seconds.
+    const double remaining = store.ttl("session");
+    ASSERT_TRUE(remaining > 0.0 && remaining <= 60.0);
+}
+
+// ---------------------------------------------------------------------------
+// S10-C. Key expires after TTL.
+// ---------------------------------------------------------------------------
+TEST(s10_key_expires_after_ttl) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    // Very short TTL: 10 ms.
+    store.set_with_ttl("temp", "val", 0.010);
+
+    // Wait for expiry (up to 200ms).
+    const bool expired = wait_until(
+        [&]() { return !store.get("temp").has_value(); },
+        std::chrono::milliseconds{500});
+    ASSERT_TRUE(expired);
+}
+
+// ---------------------------------------------------------------------------
+// S10-D. Expired key behaves as missing (get returns nullopt at read time).
+// ---------------------------------------------------------------------------
+TEST(s10_expired_key_returns_nullopt) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("x", "y", 0.010); // 10 ms TTL
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    auto result = store.get("x");
+    ASSERT_NO_VALUE(result); // Expired at read time.
+}
+
+// ---------------------------------------------------------------------------
+// S10-E. exists() returns false for expired key.
+// ---------------------------------------------------------------------------
+TEST(s10_exists_returns_false_for_expired) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("flag", "1", 0.010);
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    ASSERT_FALSE(store.exists("flag"));
+}
+
+// ---------------------------------------------------------------------------
+// S10-F. ttl() reports remaining time correctly.
+// ---------------------------------------------------------------------------
+TEST(s10_ttl_reports_remaining_time) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("k", "v", 30.0);
+    const double r = store.ttl("k");
+    ASSERT_TRUE(r > 0.0);
+    ASSERT_TRUE(r <= 30.0);
+}
+
+// ---------------------------------------------------------------------------
+// S10-G. ttl() returns kTtlPermanent for permanent key.
+// ---------------------------------------------------------------------------
+TEST(s10_ttl_permanent_key) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("perm", "value");
+    ASSERT_EQ(store.ttl("perm"), forgekv::kTtlPermanent);
+}
+
+// ---------------------------------------------------------------------------
+// S10-H. ttl() returns kTtlNotFound for missing key.
+// ---------------------------------------------------------------------------
+TEST(s10_ttl_missing_key) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    ASSERT_EQ(store.ttl("nonexistent"), forgekv::kTtlNotFound);
+}
+
+// ---------------------------------------------------------------------------
+// S10-I. ttl() returns kTtlNotFound for expired key.
+// ---------------------------------------------------------------------------
+TEST(s10_ttl_expired_key) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("exp_key", "val", 0.010);
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    ASSERT_EQ(store.ttl("exp_key"), forgekv::kTtlNotFound);
+}
+
+// ---------------------------------------------------------------------------
+// S10-J. Normal set() removes previous TTL — key becomes permanent.
+// ---------------------------------------------------------------------------
+TEST(s10_normal_set_removes_ttl) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("key", "original", 60.0);
+    ASSERT_TRUE(store.ttl("key") > 0.0);
+
+    // Overwrite with a permanent set.
+    store.set("key", "permanent_value");
+    ASSERT_EQ(store.ttl("key"), forgekv::kTtlPermanent);
+    ASSERT_EQ(*store.get("key"), "permanent_value");
+}
+
+// ---------------------------------------------------------------------------
+// S10-K. Updating TTL with set_with_ttl replaces the previous expiry.
+// ---------------------------------------------------------------------------
+TEST(s10_update_ttl_replaces_expiry) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("key", "v1", 10.0);
+    const double r1 = store.ttl("key");
+    ASSERT_TRUE(r1 > 0.0 && r1 <= 10.0);
+
+    // Update with a longer TTL.
+    store.set_with_ttl("key", "v2", 300.0);
+    const double r2 = store.ttl("key");
+    ASSERT_TRUE(r2 > 10.0 && r2 <= 300.0);
+    ASSERT_EQ(*store.get("key"), "v2");
+}
+
+// ---------------------------------------------------------------------------
+// S10-L. del() on a key with TTL works correctly.
+// ---------------------------------------------------------------------------
+TEST(s10_del_ttl_key) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("session", "data", 60.0);
+    ASSERT_TRUE(store.del("session"));
+    ASSERT_NO_VALUE(store.get("session"));
+    ASSERT_FALSE(store.exists("session"));
+    ASSERT_EQ(store.ttl("session"), forgekv::kTtlNotFound);
+}
+
+// ---------------------------------------------------------------------------
+// S10-M. clear() removes all TTL keys.
+// ---------------------------------------------------------------------------
+TEST(s10_clear_removes_ttl_keys) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("a", "1", 60.0);
+    store.set_with_ttl("b", "2", 60.0);
+    store.set("c", "3"); // permanent
+    store.clear();
+    ASSERT_TRUE(store.empty());
+    ASSERT_EQ(store.size(), std::size_t{0});
+    ASSERT_NO_VALUE(store.get("a"));
+    ASSERT_NO_VALUE(store.get("b"));
+    ASSERT_NO_VALUE(store.get("c"));
+}
+
+// ---------------------------------------------------------------------------
+// S10-N. ttl <= 0 causes set_with_ttl to not store the key.
+// ---------------------------------------------------------------------------
+TEST(s10_ttl_zero_key_not_stored) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+
+    // ttl == 0.0
+    store.set_with_ttl("instant_expire", "val", 0.0);
+    ASSERT_FALSE(store.exists("instant_expire"));
+    ASSERT_NO_VALUE(store.get("instant_expire"));
+
+    // ttl == -5.0
+    store.set_with_ttl("negative_ttl", "val", -5.0);
+    ASSERT_FALSE(store.exists("negative_ttl"));
+
+    ASSERT_EQ(store.size(), std::size_t{0});
+}
+
+// ---------------------------------------------------------------------------
+// S10-O. Background cleanup removes expired keys (via run_cleanup_now).
+// ---------------------------------------------------------------------------
+TEST(s10_background_cleanup_removes_expired) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("temp1", "v1", 0.010); // 10 ms TTL
+    store.set_with_ttl("temp2", "v2", 0.010);
+    store.set("perm", "permanent");
+
+    // Wait for TTL to elapse.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    // Trigger cleanup explicitly.
+    store.run_cleanup_now();
+
+    // Expired keys should be gone from storage.
+    ASSERT_NO_VALUE(store.get("temp1"));
+    ASSERT_NO_VALUE(store.get("temp2"));
+
+    // Permanent key must survive.
+    ASSERT_HAS_VALUE(store.get("perm"));
+    ASSERT_EQ(*store.get("perm"), "permanent");
+}
+
+// ---------------------------------------------------------------------------
+// S10-P. Background cleanup writes WAL DEL records (expiration is durable).
+//
+//   After cleanup removes an expired key, restart the store and verify
+//   the expired key does NOT come back.
+// ---------------------------------------------------------------------------
+TEST(s10_cleanup_writes_wal_del_for_durability) {
+    TEMP_TTL_SNAP(g);
+
+    // Phase 1: store expiring key, wait, cleanup, verify gone.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("ephemeral", "data", 0.010); // 10 ms
+        store.set("permanent", "stays");
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        store.run_cleanup_now(); // writes WAL DEL for "ephemeral"
+    }
+
+    // Phase 2: restart — "ephemeral" must NOT resurface.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_FALSE(store.exists("ephemeral"));
+        ASSERT_NO_VALUE(store.get("ephemeral"));
+        // Permanent key survives.
+        ASSERT_HAS_VALUE(store.get("permanent"));
+        ASSERT_EQ(*store.get("permanent"), "stays");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-Q. Restart before expiration preserves key.
+// ---------------------------------------------------------------------------
+TEST(s10_restart_before_expiry_preserves_key) {
+    TEMP_TTL_SNAP(g);
+
+    // Phase 1: set key with a long TTL (60s).
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("session", "token", 60.0);
+    }
+
+    // Phase 2: restart — TTL is not expired yet.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_HAS_VALUE(store.get("session"));
+        ASSERT_EQ(*store.get("session"), "token");
+        ASSERT_TRUE(store.exists("session"));
+        const double r = store.ttl("session");
+        ASSERT_TRUE(r > 0.0 && r <= 60.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-R. Restart after expiration does NOT resurrect key.
+// ---------------------------------------------------------------------------
+TEST(s10_restart_after_expiry_no_resurrection) {
+    TEMP_TTL_SNAP(g);
+
+    // Phase 1: set key with a very short TTL.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("short_lived", "val", 0.010); // 10ms
+    }
+
+    // Wait for the TTL to pass.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    // Phase 2: restart — key must NOT come back.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_FALSE(store.exists("short_lived"));
+        ASSERT_NO_VALUE(store.get("short_lived"));
+        ASSERT_EQ(store.ttl("short_lived"), forgekv::kTtlNotFound);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-S. Snapshot preserves future expiration.
+// ---------------------------------------------------------------------------
+TEST(s10_snapshot_preserves_future_expiry) {
+    TEMP_TTL_SNAP(g);
+
+    // Phase 1: set expiring key, snapshot.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("session", "abc", 60.0); // 60s
+        store.set("perm", "data");
+        ASSERT_TRUE(store.snapshot());
+    }
+
+    // Phase 2: restart — both keys must be restored.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_HAS_VALUE(store.get("session"));
+        ASSERT_EQ(*store.get("session"), "abc");
+        const double r = store.ttl("session");
+        ASSERT_TRUE(r > 0.0 && r <= 60.0);
+
+        ASSERT_HAS_VALUE(store.get("perm"));
+        ASSERT_EQ(store.ttl("perm"), forgekv::kTtlPermanent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-T. Snapshot excludes already-expired entries.
+// ---------------------------------------------------------------------------
+TEST(s10_snapshot_excludes_expired_entries) {
+    TEMP_TTL_SNAP(g);
+
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("gone", "val", 0.010); // 10ms — will expire
+        store.set("alive", "stays");
+
+        // Wait for expiry before taking snapshot.
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        ASSERT_TRUE(store.snapshot()); // "gone" must NOT be in snapshot
+    }
+
+    // Verify snapshot file does not contain "gone".
+    {
+        forgekv::SnapshotManager sm(g.wal_path);
+        const auto result = sm.load();
+        ASSERT_TRUE(result.exists && !result.corrupt);
+        for (const auto& [k, entry] : result.data.records) {
+            ASSERT_FALSE(k == "gone"); // expired key must be excluded
+        }
+    }
+
+    // Restart also must not find "gone".
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_FALSE(store.exists("gone"));
+        ASSERT_HAS_VALUE(store.get("alive"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-U. Recovery from snapshot + WAL tail preserves TTL.
+// ---------------------------------------------------------------------------
+TEST(s10_recovery_snapshot_plus_wal_tail_preserves_ttl) {
+    TEMP_TTL_SNAP(g);
+
+    // Phase 1: set a few keys, snapshot, add more.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("key1", "v1", 60.0);
+        store.set("key2", "permanent");
+        ASSERT_TRUE(store.snapshot());
+
+        // Add after snapshot.
+        store.set_with_ttl("key3", "v3", 120.0);
+    }
+
+    // Phase 2: restart via snapshot + WAL tail.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_HAS_VALUE(store.get("key1"));
+        ASSERT_TRUE(store.ttl("key1") > 0.0 && store.ttl("key1") <= 60.0);
+        ASSERT_EQ(store.ttl("key2"), forgekv::kTtlPermanent);
+        ASSERT_HAS_VALUE(store.get("key3"));
+        ASSERT_TRUE(store.ttl("key3") > 0.0 && store.ttl("key3") <= 120.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-V. Compaction preserves TTL metadata for live keys.
+// ---------------------------------------------------------------------------
+TEST(s10_compact_preserves_ttl) {
+    TEMP_TTL_SNAP(g);
+
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("expiring", "data", 60.0);
+        store.set("permanent", "value");
+        store.compact();
+
+        // After compaction, keys are still accessible.
+        ASSERT_HAS_VALUE(store.get("expiring"));
+        ASSERT_TRUE(store.ttl("expiring") > 0.0);
+        ASSERT_EQ(store.ttl("permanent"), forgekv::kTtlPermanent);
+    }
+
+    // Restart from compacted WAL — TTL must survive.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_HAS_VALUE(store.get("expiring"));
+        ASSERT_TRUE(store.ttl("expiring") > 0.0 && store.ttl("expiring") <= 60.0);
+        ASSERT_EQ(store.ttl("permanent"), forgekv::kTtlPermanent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-W. Compaction excludes expired keys.
+// ---------------------------------------------------------------------------
+TEST(s10_compact_excludes_expired_keys) {
+    TEMP_TTL_SNAP(g);
+
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("doomed", "val", 0.010); // 10ms
+        store.set("survivor", "ok");
+
+        // Wait for expiry then compact.
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        store.compact(); // "doomed" must not appear in compacted WAL
+    }
+
+    // Restart — "doomed" must not come back.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_FALSE(store.exists("doomed"));
+        ASSERT_HAS_VALUE(store.get("survivor"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-X. Old pre-TTL WAL (only SET/DEL/CLEAR) recovers correctly.
+// ---------------------------------------------------------------------------
+TEST(s10_old_wal_recovers_as_permanent_keys) {
+    TEMP_TTL_SNAP(g);
+
+    // Write a WAL with only pre-Stage-10 opcodes (SET, DEL, CLEAR).
+    {
+        forgekv::WAL wal(g.wal_path);
+        wal.append_set("old_key1", "val1");
+        wal.append_set("old_key2", "val2");
+        wal.append_del("old_key1");
+        wal.append_set("old_key3", "val3");
+    }
+
+    // Recover — all keys must be permanent.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_FALSE(store.exists("old_key1"));  // was deleted
+        ASSERT_HAS_VALUE(store.get("old_key2"));
+        ASSERT_EQ(*store.get("old_key2"), "val2");
+        ASSERT_EQ(store.ttl("old_key2"), forgekv::kTtlPermanent);
+        ASSERT_HAS_VALUE(store.get("old_key3"));
+        ASSERT_EQ(store.ttl("old_key3"), forgekv::kTtlPermanent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-Y. WAL SET_WITH_EXPIRY record has correct binary layout.
+// ---------------------------------------------------------------------------
+TEST(s10_wal_set_with_expiry_binary_layout) {
+    TEMP_TTL_SNAP(g);
+
+    std::uint64_t recorded_expires = 0;
+    {
+        forgekv::WAL wal(g.wal_path);
+        // Compute expires_at_us manually (10 second TTL from now).
+        const auto now = std::chrono::system_clock::now();
+        const auto us  = std::chrono::duration_cast<std::chrono::microseconds>(
+                             now.time_since_epoch() +
+                             std::chrono::seconds{10}).count();
+        recorded_expires = static_cast<std::uint64_t>(us);
+        wal.append_set_with_expiry("mykey", "myval", recorded_expires);
+    }
+
+    // Replay and verify the record.
+    {
+        forgekv::WAL wal(g.wal_path);
+        std::vector<forgekv::WalRecord> records;
+        (void)wal.replay([&](const forgekv::WalRecord& r) {
+            records.push_back(r);
+        });
+
+        ASSERT_EQ(records.size(), std::size_t{1});
+        ASSERT_EQ(records[0].opcode, forgekv::kOpSetWithExpiry);
+        ASSERT_EQ(records[0].key,    "mykey");
+        ASSERT_EQ(records[0].value,  "myval");
+        ASSERT_EQ(records[0].expires_at_us, recorded_expires);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-Z. Concurrent TTL cleanup with readers/writers — no deadlock or race.
+// ---------------------------------------------------------------------------
+TEST(s10_concurrent_cleanup_with_readers_writers) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+
+    // Pre-populate with some keys.
+    for (int i = 0; i < 20; ++i) {
+        store.set("key" + std::to_string(i), "val" + std::to_string(i));
+    }
+    // Add some expiring keys.
+    for (int i = 0; i < 10; ++i) {
+        store.set_with_ttl("exp" + std::to_string(i), "v", 0.020); // 20ms
+    }
+
+    std::atomic<bool> stop{false};
+
+    // Reader thread.
+    std::thread reader([&]() {
+        while (!stop.load()) {
+            for (int i = 0; i < 20; ++i) {
+                (void)store.get("key" + std::to_string(i));
+                (void)store.exists("exp" + std::to_string(i));
+            }
+        }
+    });
+
+    // Writer thread.
+    std::thread writer([&]() {
+        int counter = 0;
+        while (!stop.load()) {
+            store.set("writer_key", "val" + std::to_string(counter++));
+        }
+    });
+
+    // Wait for TTL to elapse, then run cleanup.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    store.run_cleanup_now();
+
+    stop.store(true);
+    reader.join();
+    writer.join();
+
+    // All expired keys should be gone.
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_FALSE(store.exists("exp" + std::to_string(i)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-AA. KeyValueStore destructor cleanly stops the cleanup thread.
+// ---------------------------------------------------------------------------
+TEST(s10_destructor_joins_cleanup_thread) {
+    TEMP_TTL_SNAP(g);
+
+    // Create store, add some expiring keys, then destroy it.
+    // The destructor must not hang and must properly join the thread.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("k1", "v1", 60.0);
+        store.set_with_ttl("k2", "v2", 60.0);
+        // store destructor runs here — must join without hanging.
+    }
+    // If we reach here without a hang, the test passes.
+    ASSERT_TRUE(true);
+}
+
+// ---------------------------------------------------------------------------
+// S10-AB. Multiple expiring keys with different deadlines.
+// ---------------------------------------------------------------------------
+TEST(s10_multiple_expiring_keys_different_deadlines) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+
+    store.set_with_ttl("fast",   "v1", 0.020); // 20ms
+    store.set_with_ttl("medium", "v2", 60.0);  // 60s
+    store.set_with_ttl("slow",   "v3", 3600.0); // 1 hour
+    store.set("perm", "permanent");
+
+    // Immediately: all keys accessible.
+    ASSERT_HAS_VALUE(store.get("fast"));
+    ASSERT_HAS_VALUE(store.get("medium"));
+    ASSERT_HAS_VALUE(store.get("slow"));
+    ASSERT_HAS_VALUE(store.get("perm"));
+
+    // Wait for "fast" to expire.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    ASSERT_NO_VALUE(store.get("fast"));      // expired
+    ASSERT_HAS_VALUE(store.get("medium"));   // still alive
+    ASSERT_HAS_VALUE(store.get("slow"));     // still alive
+    ASSERT_HAS_VALUE(store.get("perm"));     // permanent
+}
+
+// ---------------------------------------------------------------------------
+// S10-AC. Large number of TTL keys (stress test).
+// ---------------------------------------------------------------------------
+TEST(s10_large_number_of_ttl_keys) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+
+    constexpr int N = 500;
+    for (int i = 0; i < N; ++i) {
+        store.set_with_ttl("k" + std::to_string(i), "v" + std::to_string(i), 0.020);
+    }
+
+    ASSERT_EQ(store.size(), std::size_t{N});
+
+    // Wait for all to expire.
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+
+    // After expiry, all should be gone.
+    for (int i = 0; i < N; ++i) {
+        ASSERT_FALSE(store.exists("k" + std::to_string(i)));
+    }
+
+    // size() should be 0.
+    ASSERT_EQ(store.size(), std::size_t{0});
+    ASSERT_TRUE(store.empty());
+}
+
+// ---------------------------------------------------------------------------
+// S10-AD. del() on expired key returns false (expired == not found).
+// ---------------------------------------------------------------------------
+TEST(s10_del_expired_key_returns_false) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("ephemeral", "val", 0.010);
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    // del() on an expired (logically absent) key must return false.
+    ASSERT_FALSE(store.del("ephemeral"));
+}
+
+// ---------------------------------------------------------------------------
+// S10-AE. size() and empty() respect TTL.
+// ---------------------------------------------------------------------------
+TEST(s10_size_and_empty_respect_ttl) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+
+    store.set("perm", "1");
+    store.set_with_ttl("exp", "2", 0.010);
+
+    ASSERT_EQ(store.size(), std::size_t{2});
+    ASSERT_FALSE(store.empty());
+
+    // Wait for "exp" to expire.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    // Now only 1 live key.
+    ASSERT_EQ(store.size(), std::size_t{1});
+    ASSERT_FALSE(store.empty());
+
+    store.del("perm");
+    ASSERT_EQ(store.size(), std::size_t{0});
+    ASSERT_TRUE(store.empty());
+}
+
+// ---------------------------------------------------------------------------
+// S10-AF. run_cleanup_now() forces immediate expiration and WAL writes.
+// ---------------------------------------------------------------------------
+TEST(s10_run_cleanup_now_forces_expiration) {
+    TEMP_TTL_SNAP(g);
+
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set_with_ttl("temp", "val", 0.010);
+        store.set("keeper", "alive");
+
+        // Let TTL expire, then force cleanup.
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        store.run_cleanup_now();
+
+        // "temp" should be gone from storage AND from WAL.
+        ASSERT_FALSE(store.exists("temp"));
+    }
+
+    // Restart — cleanup wrote WAL DEL so "temp" must not come back.
+    {
+        auto store = make_ttl_store(g.wal_path);
+        ASSERT_FALSE(store.exists("temp"));
+        ASSERT_HAS_VALUE(store.get("keeper"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S10-AG. Snapshot v2 binary format: has_expiry flag is written correctly.
+// ---------------------------------------------------------------------------
+TEST(s10_snapshot_v2_binary_format) {
+    TEMP_TTL_SNAP(g);
+
+    {
+        auto store = make_ttl_store(g.wal_path);
+        store.set("perm_key", "perm_val");           // permanent
+        store.set_with_ttl("exp_key", "exp_val", 60.0); // expiring
+        ASSERT_TRUE(store.snapshot());
+    }
+
+    // Load the snapshot directly and check v2 fields.
+    forgekv::SnapshotManager sm(g.wal_path);
+    const auto result = sm.load();
+    ASSERT_TRUE(result.exists);
+    ASSERT_FALSE(result.corrupt);
+    ASSERT_EQ(result.data.records.size(), std::size_t{2});
+
+    // Check the version byte = 0x02.
+    const auto raw = read_file_bytes(g.snap_path);
+    ASSERT_EQ(raw[4], forgekv::kSnapshotVersionV2);
+
+    // Verify that we can find both entries with correct expiry info.
+    bool found_perm = false, found_exp = false;
+    for (const auto& [k, entry] : result.data.records) {
+        if (k == "perm_key") {
+            ASSERT_FALSE(entry.has_expiry());
+            ASSERT_EQ(entry.value, "perm_val");
+            found_perm = true;
+        } else if (k == "exp_key") {
+            ASSERT_TRUE(entry.has_expiry());
+            ASSERT_TRUE(entry.expires_at_us > 0);
+            ASSERT_EQ(entry.value, "exp_val");
+            found_exp = true;
+        }
+    }
+    ASSERT_TRUE(found_perm);
+    ASSERT_TRUE(found_exp);
+}
+
+// ---------------------------------------------------------------------------
+// S10-AH. Snapshot v1 (Stage 9 format) loads as permanent entries.
+//
+//   Write a v1-format snapshot manually (version byte = 0x01,
+//   no has_expiry fields), verify that load() treats all entries as permanent.
+// ---------------------------------------------------------------------------
+TEST(s10_snapshot_v1_backward_compat) {
+    TEMP_TTL_SNAP(g);
+
+    // Manually write a v1 snapshot.
+    {
+        const std::string snap_path = g.snap_path;
+
+        // Helper to encode u32 LE.
+        auto enc32 = [](std::vector<std::uint8_t>& v, std::uint32_t x) {
+            v.push_back(x & 0xFF); v.push_back((x>>8)&0xFF);
+            v.push_back((x>>16)&0xFF); v.push_back((x>>24)&0xFF);
+        };
+        // Helper to encode u64 LE.
+        auto enc64 = [](std::vector<std::uint8_t>& v, std::uint64_t x) {
+            for (int i = 0; i < 8; ++i) { v.push_back((x >> (8*i)) & 0xFF); }
+        };
+        // CRC32.
+        auto crc32 = [](const std::vector<std::uint8_t>& data) -> std::uint32_t {
+            std::uint32_t crc = 0xFFFFFFFF;
+            for (auto b : data) {
+                crc ^= b;
+                for (int i = 0; i < 8; ++i) {
+                    crc = (crc >> 1) ^ (0xEDB88320 * (crc & 1));
+                }
+            }
+            return crc ^ 0xFFFFFFFF;
+        };
+
+        std::vector<std::uint8_t> buf;
+        enc32(buf, 0x464B534Eu);  // magic
+        buf.push_back(0x01);       // version v1
+        enc64(buf, 0u);            // wal_offset = 0
+        enc32(buf, 1u);            // 1 record
+
+        // Record: key="v1key", val="v1val" (no has_expiry field).
+        const std::string key = "v1key", val = "v1val";
+        enc32(buf, static_cast<std::uint32_t>(key.size()));
+        for (char c : key)  buf.push_back(static_cast<std::uint8_t>(c));
+        enc32(buf, static_cast<std::uint32_t>(val.size()));
+        for (char c : val)  buf.push_back(static_cast<std::uint8_t>(c));
+
+        enc32(buf, crc32(buf));
+
+        std::ofstream out(snap_path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(buf.data()),
+                  static_cast<std::streamsize>(buf.size()));
+    }
+
+    // Load the v1 snapshot and verify all entries are permanent.
+    forgekv::SnapshotManager sm(g.wal_path);
+    const auto result = sm.load();
+    ASSERT_TRUE(result.exists);
+    ASSERT_FALSE(result.corrupt);
+    ASSERT_EQ(result.data.records.size(), std::size_t{1});
+
+    const auto& [k, entry] = result.data.records[0];
+    ASSERT_EQ(k, "v1key");
+    ASSERT_EQ(entry.value, "v1val");
+    ASSERT_FALSE(entry.has_expiry()); // v1 entries are permanent
+}
+
+// ---------------------------------------------------------------------------
+// S10-AI. ttl = 0 edge case: set_with_ttl(key, val, 0.0) does not store key.
+// ---------------------------------------------------------------------------
+TEST(s10_ttl_exactly_zero_not_stored) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("zero_ttl", "value", 0.0);
+    ASSERT_FALSE(store.exists("zero_ttl"));
+    ASSERT_NO_VALUE(store.get("zero_ttl"));
+    ASSERT_EQ(store.ttl("zero_ttl"), forgekv::kTtlNotFound);
+    ASSERT_EQ(store.size(), std::size_t{0});
+}
+
+// =============================================================================
+// End of Stage 10 tests
 // =============================================================================
 
 int main() {
