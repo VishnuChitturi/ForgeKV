@@ -142,6 +142,44 @@ void HttpServer::stop() {
 //   Endpoint bodies will be filled in Stage 6B.
 
 void HttpServer::register_routes() {
+    // =========================================================================
+    // CORS support
+    // =========================================================================
+    //
+    // Two mechanisms work together:
+    //
+    // 1. set_post_routing_handler — runs after every dispatched request
+    //    (GET, PUT, DELETE, POST, OPTIONS) and before the response is written.
+    //    Injects Access-Control-Allow-Origin: * on every response so that
+    //    simple cross-origin requests (GET /health, GET /stats, etc.) succeed.
+    //
+    // 2. Options(".*") — catches all OPTIONS preflight requests regardless of
+    //    path. Returns 204 No Content with the full set of preflight headers.
+    //    The pattern ".*" has no "/:" so cpp-httplib treats it as a regex
+    //    matching any path.
+    //
+    // Allowed methods: GET, PUT, DELETE, POST, OPTIONS
+    // Allowed headers: Content-Type, X-TTL-Seconds
+    // Max-Age: 86400 (24 hours — browsers cache the preflight result)
+
+    server_.set_post_routing_handler(
+        [](const httplib::Request& /*req*/, httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin",  "*");
+            res.set_header("Access-Control-Allow-Methods",
+                           "GET, PUT, DELETE, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers",
+                           "Content-Type, X-TTL-Seconds");
+        });
+
+    // OPTIONS preflight handler — catches every path.
+    // Returns 204 No Content; the post_routing_handler above then appends
+    // the Allow-Origin / Allow-Methods / Allow-Headers headers.
+    server_.Options(".*", [](const httplib::Request& /*req*/,
+                              httplib::Response& res) {
+        res.status = 204;
+        res.set_header("Access-Control-Max-Age", "86400");
+    });
+
     // -------------------------------------------------------------------------
     // GET /key/:key — retrieve the value for a key
     // -------------------------------------------------------------------------
