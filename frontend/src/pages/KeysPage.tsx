@@ -1,6 +1,15 @@
 // =============================================================================
 // KeysPage — Stage 16: Full Key Management UI
 //
+// Stage 19 changes:
+//   - searchInput now syncs from URL params on browser back/forward navigation.
+//   - Post-delete page clamping: if the deleted key was the last on the
+//     current page, goToPage(prev_page) re-navigates to valid page.
+//   - Shared button styles (btnSecondary, btnPrimary, btnDanger) moved to
+//     Page.module.css — KeysPage-specific ones (btnIcon, btnIconSpin,
+//     actionBtn variants, search inputs) remain in KeysPage.module.css.
+//   - All duplicate headerRow/headerActions CSS removed from module file.
+//
 // Features:
 //   - Browse keys with real ForgeKV data
 //   - Search / filter by prefix
@@ -13,7 +22,7 @@
 //   - Loading + error + empty states
 //   - Toast success feedback
 //   - Responsive table with horizontal scroll on mobile
-//   - Accessible: labels, roles, keyboard-navigable modal
+//   - Accessible: labels, roles, keyboard-navigable modal with focus trap
 // =============================================================================
 
 import {
@@ -45,7 +54,7 @@ const PAGE_SIZE = 50;
 type TtlMode = "permanent" | "custom";
 
 function parseTtlFromForm(mode: TtlMode, raw: string): number | undefined {
-  if (mode === "permanent") return undefined; // omit header → permanent
+  if (mode === "permanent") return undefined;
   const v = parseFloat(raw);
   return isNaN(v) || v <= 0 ? undefined : v;
 }
@@ -56,37 +65,41 @@ function parseTtlFromForm(mode: TtlMode, raw: string): number | undefined {
 export function KeysPage() {
   const [searchParams, setSearchParams] = useSearchParams();
 
-  // Derive prefix and page from URL query params
+  // Derive prefix and page from URL query params.
   const urlPrefix = searchParams.get("prefix") ?? "";
   const urlPage = Math.max(1, parseInt(searchParams.get("page") ?? "1", 10) || 1);
 
   // Local UI state
-  const [prefix, setPrefix]       = useState(urlPrefix);
-  const [page, setPage]           = useState(urlPage);
-  const [keys, setKeys]           = useState<KeyInfo[]>([]);
-  const [total, setTotal]         = useState(0);
-  const [loading, setLoading]     = useState(true);
+  const [prefix, setPrefix]         = useState(urlPrefix);
+  const [page, setPage]             = useState(urlPage);
+  const [keys, setKeys]             = useState<KeyInfo[]>([]);
+  const [total, setTotal]           = useState(0);
+  const [loading, setLoading]       = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError]         = useState<string | null>(null);
-  const hasLoadedRef              = useRef(false);
+  const [error, setError]           = useState<string | null>(null);
+  const hasLoadedRef                = useRef(false);
+
+  // searchInput tracks what the user typed; kept in sync with URL.
+  const [searchInput, setSearchInput] = useState(urlPrefix);
 
   // Modal states
-  const [viewKey, setViewKey]     = useState<KeyInfo | null>(null);
-  const [editKey, setEditKey]     = useState<KeyInfo | null>(null);
+  const [viewKey, setViewKey]           = useState<KeyInfo | null>(null);
+  const [editKey, setEditKey]           = useState<KeyInfo | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<KeyInfo | null>(null);
-  const [createOpen, setCreateOpen] = useState(false);
+  const [createOpen, setCreateOpen]     = useState(false);
 
   const { toasts, addToast, dismissToast } = useToast();
 
   // ---------------------------------------------------------------------------
-  // Sync URL ↔ state
+  // Sync URL ↔ state (browser back/forward, direct URL changes)
+  // searchInput is also synced here so the search field reflects the URL.
   // ---------------------------------------------------------------------------
-  // When URL changes externally (browser back/forward), sync to state.
   useEffect(() => {
-    const p = searchParams.get("prefix") ?? "";
+    const p  = searchParams.get("prefix") ?? "";
     const pg = Math.max(1, parseInt(searchParams.get("page") ?? "1", 10) || 1);
     setPrefix(p);
     setPage(pg);
+    setSearchInput(p); // ← Stage 19 fix: keep search field in sync with URL
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
@@ -122,7 +135,6 @@ export function KeysPage() {
     []
   );
 
-  // Fetch on mount and whenever prefix/page changes.
   useEffect(() => {
     fetchKeys({ prefix, page });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -131,8 +143,6 @@ export function KeysPage() {
   // ---------------------------------------------------------------------------
   // Search submit
   // ---------------------------------------------------------------------------
-  const [searchInput, setSearchInput] = useState(urlPrefix);
-
   const handleSearch = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
@@ -173,6 +183,11 @@ export function KeysPage() {
 
   // ---------------------------------------------------------------------------
   // Delete
+  //
+  // Stage 19: after deletion, check if the current page is now out of range
+  // (i.e., we deleted the last item on the last page). If so, navigate to
+  // the previous page so the table doesn't show an empty page with a valid
+  // prior page available.
   // ---------------------------------------------------------------------------
   const [deleting, setDeleting] = useState(false);
 
@@ -188,8 +203,21 @@ export function KeysPage() {
       return;
     }
     addToast(`Deleted "${deleteTarget.key}"`, "success");
-    fetchKeys({ prefix, page, isRefresh: true });
-  }, [deleteTarget, addToast, fetchKeys, prefix, page]);
+
+    // Calculate new total after deletion
+    const newTotal = Math.max(0, total - 1);
+    const newTotalPages = Math.max(1, Math.ceil(newTotal / PAGE_SIZE));
+
+    if (page > newTotalPages) {
+      // Current page is no longer valid — navigate back to last valid page.
+      const clamped = newTotalPages;
+      const params: Record<string, string> = { page: String(clamped) };
+      if (prefix) params.prefix = prefix;
+      setSearchParams(params);
+    } else {
+      fetchKeys({ prefix, page, isRefresh: true });
+    }
+  }, [deleteTarget, addToast, fetchKeys, prefix, page, total, setSearchParams]);
 
   // ---------------------------------------------------------------------------
   // Create / edit success callback
@@ -216,16 +244,16 @@ export function KeysPage() {
     <div className={pageStyles.page}>
       {/* ---- Header ---- */}
       <header className={pageStyles.pageHeader}>
-        <div className={styles.headerRow}>
+        <div className={pageStyles.headerRow}>
           <div>
             <h1 className={pageStyles.pageTitle}>Keys</h1>
             <p className={pageStyles.pageDescription}>
               Browse, create, update, and delete keys in the ForgeKV store.
             </p>
           </div>
-          <div className={styles.headerActions}>
+          <div className={pageStyles.headerActions}>
             <button
-              className={styles.btnSecondary}
+              className={`${pageStyles.btnSecondary} ${styles.refreshBtn}`}
               type="button"
               onClick={handleRefresh}
               disabled={loading || refreshing}
@@ -240,7 +268,7 @@ export function KeysPage() {
               {refreshing ? "Refreshing…" : "Refresh"}
             </button>
             <button
-              className={styles.btnPrimary}
+              className={pageStyles.btnPrimary}
               type="button"
               onClick={() => setCreateOpen(true)}
               aria-label="Create a new key"
@@ -273,13 +301,13 @@ export function KeysPage() {
               spellCheck={false}
             />
           </div>
-          <button type="submit" className={styles.btnSecondary}>
+          <button type="submit" className={pageStyles.btnSecondary}>
             Search
           </button>
           {prefix && (
             <button
               type="button"
-              className={styles.btnSecondary}
+              className={pageStyles.btnSecondary}
               onClick={handleClearSearch}
               aria-label="Clear prefix filter"
             >
@@ -290,7 +318,7 @@ export function KeysPage() {
 
         {/* ---- Initial loading ---- */}
         {loading && (
-          <div style={{ display: "flex", justifyContent: "center", padding: "4rem 0" }}>
+          <div className={styles.loadingCenter}>
             <Loading label="Loading keys…" size="lg" />
           </div>
         )}
@@ -315,7 +343,7 @@ export function KeysPage() {
                 description="Create your first key to get started."
                 action={
                   <button
-                    className={styles.btnPrimary}
+                    className={pageStyles.btnPrimary}
                     type="button"
                     onClick={() => setCreateOpen(true)}
                   >
@@ -332,7 +360,7 @@ export function KeysPage() {
                 description="Try a different prefix or clear the search."
                 action={
                   <button
-                    className={styles.btnSecondary}
+                    className={pageStyles.btnSecondary}
                     type="button"
                     onClick={handleClearSearch}
                   >
@@ -388,7 +416,7 @@ export function KeysPage() {
                   </span>
                   <div className={styles.paginationControls}>
                     <button
-                      className={styles.btnSecondary}
+                      className={pageStyles.btnSecondary}
                       type="button"
                       onClick={() => goToPage(page - 1)}
                       disabled={page <= 1}
@@ -400,7 +428,7 @@ export function KeysPage() {
                       Page {page} / {totalPages}
                     </span>
                     <button
-                      className={styles.btnSecondary}
+                      className={pageStyles.btnSecondary}
                       type="button"
                       onClick={() => goToPage(page + 1)}
                       disabled={page >= totalPages}
@@ -454,14 +482,14 @@ export function KeysPage() {
           <p className={styles.confirmTitle}>
             Delete{" "}
             <span className={styles.confirmKey}>
-              "{deleteTarget?.key}"
+              &quot;{deleteTarget?.key}&quot;
             </span>
             ?
           </p>
           <p className={styles.confirmSub}>This action cannot be undone.</p>
           <div className={styles.confirmActions}>
             <button
-              className={styles.btnSecondary}
+              className={pageStyles.btnSecondary}
               type="button"
               onClick={() => setDeleteTarget(null)}
               disabled={deleting}
@@ -469,7 +497,7 @@ export function KeysPage() {
               Cancel
             </button>
             <button
-              className={styles.btnDanger}
+              className={pageStyles.btnDanger}
               type="button"
               onClick={handleConfirmDelete}
               disabled={deleting}
@@ -527,7 +555,7 @@ function KeyRow({ item, onView, onEdit, onDelete }: KeyRowProps) {
       <td className={styles.colActions}>
         <div
           className={styles.actions}
-          onClick={(e) => e.stopPropagation()} // don't trigger row click
+          onClick={(e) => e.stopPropagation()}
         >
           <button
             className={styles.actionBtnEdit}
@@ -588,11 +616,11 @@ function ViewModal({ item, onClose, onEdit }: ViewModalProps) {
         </div>
 
         <div className={styles.modalFooter}>
-          <button className={styles.btnSecondary} type="button" onClick={onClose}>
+          <button className={pageStyles.btnSecondary} type="button" onClick={onClose}>
             Close
           </button>
           <button
-            className={styles.btnPrimary}
+            className={pageStyles.btnPrimary}
             type="button"
             onClick={() => onEdit(item)}
           >
@@ -623,7 +651,7 @@ function CreateModal({ isOpen, onClose, onSuccess, onError }: CreateModalProps) 
   const [saving, setSaving]         = useState(false);
   const [formError, setFormError]   = useState<string | null>(null);
 
-  // Reset form when modal opens/closes.
+  // Reset form when modal opens.
   useEffect(() => {
     if (isOpen) {
       setKeyField("");
@@ -723,7 +751,7 @@ function CreateModal({ isOpen, onClose, onSuccess, onError }: CreateModalProps) 
         <div className={styles.modalFooter}>
           <button
             type="button"
-            className={styles.btnSecondary}
+            className={pageStyles.btnSecondary}
             onClick={onClose}
             disabled={saving}
           >
@@ -731,7 +759,7 @@ function CreateModal({ isOpen, onClose, onSuccess, onError }: CreateModalProps) 
           </button>
           <button
             type="submit"
-            className={styles.btnPrimary}
+            className={pageStyles.btnPrimary}
             disabled={saving}
           >
             {saving ? "Creating…" : "Create Key"}
@@ -760,10 +788,9 @@ function EditModal({ item, onClose, onSuccess, onError }: EditModalProps) {
   const [saving, setSaving]         = useState(false);
   const [formError, setFormError]   = useState<string | null>(null);
 
-  // Populate form when item changes (modal opens with different key).
+  // Populate form when item changes.
   useEffect(() => {
     if (item) {
-      // Fetch the freshest value from the backend so we don't show stale data.
       let cancelled = false;
       (async () => {
         const res = await getKey(item.key);
@@ -775,7 +802,6 @@ function EditModal({ item, onClose, onSuccess, onError }: EditModalProps) {
         }
       })();
 
-      // Pre-fill TTL from the listing data.
       if (item.ttl_seconds < 0) {
         setTtlMode("permanent");
         setTtlValue("");
@@ -871,7 +897,7 @@ function EditModal({ item, onClose, onSuccess, onError }: EditModalProps) {
         <div className={styles.modalFooter}>
           <button
             type="button"
-            className={styles.btnSecondary}
+            className={pageStyles.btnSecondary}
             onClick={onClose}
             disabled={saving}
           >
@@ -879,7 +905,7 @@ function EditModal({ item, onClose, onSuccess, onError }: EditModalProps) {
           </button>
           <button
             type="submit"
-            className={styles.btnPrimary}
+            className={pageStyles.btnPrimary}
             disabled={saving}
           >
             {saving ? "Saving…" : "Save Changes"}

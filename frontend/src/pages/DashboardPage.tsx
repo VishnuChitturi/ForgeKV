@@ -1,14 +1,13 @@
 // =============================================================================
-// DashboardPage — real ForgeKV dashboard (Stage 15)
+// DashboardPage — Stage 15 (polished Stage 19)
 //
 // Fetches GET /health and GET /stats on mount and on manual refresh.
 // No polling. No websockets. No global state library.
 //
-// Layout:
-//   1. Page header   — title, description, last-updated, refresh button
-//   2. ServerOverview — status + key metrics strip
-//   3. Summary cards  — 8 primary metric cards in a responsive grid
-//   4. Statistics     — "Operation Statistics" + "Persistence" detail tables
+// Stage 19 changes:
+//   - headerRow, headerActions, lastUpdated, refreshBtn, refreshIcon,
+//     refreshIconSpin, loadingCenter, errorWrapper, content,
+//     contentRefreshing, sectionTitle now come from Page.module.css.
 // =============================================================================
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -43,8 +42,7 @@ export function DashboardPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
 
-  // Tracks whether the initial load has completed at least once. Controls
-  // whether we show the full loading overlay vs a subtle refresh indicator.
+  // Tracks whether the initial load has completed at least once.
   const hasLoadedRef = useRef(false);
 
   // -------------------------------------------------------------------------
@@ -57,7 +55,6 @@ export function DashboardPage() {
       setState({ phase: "loading" });
     }
 
-    // Both requests run concurrently
     const [healthResult, statsResult] = await Promise.all([
       getHealth(),
       getStats(),
@@ -90,28 +87,28 @@ export function DashboardPage() {
     <div className={pageStyles.page}>
       {/* -- Page header -- */}
       <header className={pageStyles.pageHeader}>
-        <div className={styles.headerRow}>
+        <div className={pageStyles.headerRow}>
           <div>
             <h1 className={pageStyles.pageTitle}>Dashboard</h1>
             <p className={pageStyles.pageDescription}>
               Real-time operational overview of the ForgeKV engine.
             </p>
           </div>
-          <div className={styles.headerActions}>
+          <div className={pageStyles.headerActions}>
             {lastUpdated !== null && (
-              <span className={styles.lastUpdated} aria-live="polite">
+              <span className={pageStyles.lastUpdated} aria-live="polite">
                 Updated: {formatLastUpdated(lastUpdated)}
               </span>
             )}
             <button
-              className={styles.refreshBtn}
+              className={pageStyles.refreshBtn}
               type="button"
               onClick={fetchData}
               disabled={refreshing || state.phase === "loading"}
               aria-label="Refresh dashboard"
             >
               <span
-                className={refreshing ? styles.refreshIconSpin : styles.refreshIcon}
+                className={refreshing ? pageStyles.refreshIconSpin : pageStyles.refreshIcon}
                 aria-hidden="true"
               >
                 ↻
@@ -126,14 +123,14 @@ export function DashboardPage() {
       <div className={pageStyles.pageBody}>
         {/* Loading state — only shown on first load */}
         {state.phase === "loading" && (
-          <div className={styles.loadingCenter}>
+          <div className={pageStyles.loadingCenter}>
             <Loading label="Loading dashboard…" size="lg" />
           </div>
         )}
 
         {/* Error state */}
         {state.phase === "error" && (
-          <div className={styles.errorWrapper}>
+          <div className={pageStyles.errorWrapper}>
             <ErrorMessage
               title="Unable to load ForgeKV statistics."
               message={state.message}
@@ -144,10 +141,10 @@ export function DashboardPage() {
 
         {/* Ready state */}
         {state.phase === "ready" && (
-          <div className={`${styles.content} ${refreshing ? styles.contentRefreshing : ""}`}>
+          <div className={`${pageStyles.content} ${refreshing ? pageStyles.contentRefreshing : ""}`}>
             {/* 1. Server Overview strip */}
             <section aria-labelledby="overview-heading">
-              <h2 id="overview-heading" className={styles.sectionTitle}>
+              <h2 id="overview-heading" className={pageStyles.sectionTitle}>
                 Server Overview
               </h2>
               <ServerOverview
@@ -158,7 +155,7 @@ export function DashboardPage() {
 
             {/* 2. Summary cards */}
             <section aria-labelledby="summary-heading">
-              <h2 id="summary-heading" className={styles.sectionTitle}>
+              <h2 id="summary-heading" className={pageStyles.sectionTitle}>
                 Summary
               </h2>
               <div className={styles.cardGrid}>
@@ -215,7 +212,7 @@ export function DashboardPage() {
 
             {/* 3. Detail statistics */}
             <section aria-labelledby="stats-heading">
-              <h2 id="stats-heading" className={styles.sectionTitle}>
+              <h2 id="stats-heading" className={pageStyles.sectionTitle}>
                 Statistics
               </h2>
               <div className={styles.statGroupGrid}>

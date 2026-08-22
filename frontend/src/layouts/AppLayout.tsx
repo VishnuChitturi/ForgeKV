@@ -21,6 +21,13 @@ export function AppLayout() {
   return (
     <div className={styles.shell}>
       {/* ------------------------------------------------------------------ */}
+      {/* Skip-to-main link — keyboard accessibility                         */}
+      {/* ------------------------------------------------------------------ */}
+      <a href="#main-content" className={styles.skipLink}>
+        Skip to main content
+      </a>
+
+      {/* ------------------------------------------------------------------ */}
       {/* Top bar                                                             */}
       {/* ------------------------------------------------------------------ */}
       <header className={styles.topbar}>
@@ -50,17 +57,26 @@ export function AppLayout() {
                   }
                   aria-current={undefined}
                 >
-                  <span className={styles.navIcon} aria-hidden="true">
-                    {icon}
-                  </span>
-                  <span className={styles.navLabel}>{label}</span>
+                  {({ isActive }) => (
+                    <>
+                      {/* aria-current="page" on the inner content div so
+                          the NavLink itself carries the attribute naturally */}
+                      <span className={styles.navIcon} aria-hidden="true">
+                        {icon}
+                      </span>
+                      <span className={styles.navLabel}>{label}</span>
+                      {isActive && (
+                        <span className={styles.srOnly}>(current page)</span>
+                      )}
+                    </>
+                  )}
                 </NavLink>
               </li>
             ))}
           </ul>
 
           <footer className={styles.sidebarFooter}>
-            <span className={styles.footerText}>ForgeKV&nbsp;·&nbsp;Stage&nbsp;16</span>
+            <span className={styles.footerText}>ForgeKV&nbsp;·&nbsp;Stage&nbsp;19</span>
           </footer>
         </nav>
 

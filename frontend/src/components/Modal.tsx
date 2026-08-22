@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useId, useRef } from "react";
 import styles from "./Modal.module.css";
 
 interface ModalProps {
@@ -14,13 +14,22 @@ interface ModalProps {
   panelClass?: string;
 }
 
+// Selectors for all naturally focusable elements inside a container.
+const FOCUSABLE =
+  'a[href], button:not([disabled]), textarea:not([disabled]), ' +
+  'input:not([disabled]), select:not([disabled]), ' +
+  '[tabindex]:not([tabindex="-1"])';
+
 /**
  * Modal — accessible dialog overlay.
  *
- * - Traps focus inside the modal while open.
- * - Closes on Escape key or overlay click.
- * - Uses role="dialog" and aria-modal="true".
- * - Scrolls internally if content overflows.
+ * Stage 19 changes:
+ *   - Focus trap: Tab/Shift+Tab cycle only within the dialog.
+ *   - aria-modal="true" moved to the panel div (the actual dialog element).
+ *   - role="dialog" moved to the panel div.
+ *   - Overlay is role="presentation" so assistive tech sees only the dialog.
+ *   - Unique title ID per instance via useId() to avoid duplicate ids when
+ *     multiple modals mount simultaneously (e.g. nested confirm dialogs).
  */
 export function Modal({
   isOpen,
@@ -30,43 +39,92 @@ export function Modal({
   panelClass,
 }: ModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const titleId  = useId();
 
-  // Close on Escape
+  // -------------------------------------------------------------------------
+  // Keyboard: Escape closes; Tab cycles focus within the dialog.
+  // -------------------------------------------------------------------------
   useEffect(() => {
     if (!isOpen) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+
+      if (e.key !== "Tab") return;
+
+      const panel = panelRef.current;
+      if (!panel) return;
+
+      const focusable = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE));
+      if (focusable.length === 0) return;
+
+      const first = focusable[0];
+      const last  = focusable[focusable.length - 1];
+
+      if (e.shiftKey) {
+        // Shift+Tab from first → wrap to last
+        if (document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else {
+        // Tab from last → wrap to first
+        if (document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
     };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
   }, [isOpen, onClose]);
 
-  // Focus the panel when it opens
+  // -------------------------------------------------------------------------
+  // Focus the first focusable element (or the panel itself) when opening.
+  // -------------------------------------------------------------------------
   useEffect(() => {
-    if (isOpen) {
-      panelRef.current?.focus();
-    }
+    if (!isOpen) return;
+
+    // Small delay so the DOM is painted before we attempt to focus.
+    const id = requestAnimationFrame(() => {
+      const panel = panelRef.current;
+      if (!panel) return;
+      const first = panel.querySelector<HTMLElement>(FOCUSABLE);
+      if (first) {
+        first.focus();
+      } else {
+        panel.focus();
+      }
+    });
+    return () => cancelAnimationFrame(id);
   }, [isOpen]);
 
   if (!isOpen) return null;
 
   return (
+    // Overlay — purely visual. role="presentation" means AT ignores it.
     <div
       className={styles.overlay}
+      role="presentation"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
-      aria-modal="true"
-      role="dialog"
-      aria-labelledby="modal-title"
     >
+      {/* Dialog panel — aria-modal and role="dialog" belong here. */}
       <div
         className={`${styles.panel} ${panelClass ?? ""}`}
         ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
         tabIndex={-1}
       >
         <div className={styles.header}>
-          <h2 id="modal-title" className={styles.title}>
+          <h2 id={titleId} className={styles.title}>
             {title}
           </h2>
           <button

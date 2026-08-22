@@ -1,5 +1,5 @@
 /* =============================================================================
-   KeysPage — Stage 16
+   KeysPage — Stage 16 (Stage 19: shared btn/header styles moved to Page.module.css)
    ============================================================================= */
 
 /* ---------------------------------------------------------------------------
@@ -53,58 +53,11 @@
   font-family: var(--font-sans);
 }
 
-/* Buttons */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.375rem;
-  padding: 0.4375rem 0.875rem;
-  font-size: 0.875rem;
-  font-weight: 500;
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background 0.12s, border-color 0.12s, color 0.12s, opacity 0.12s;
-  border: 1px solid transparent;
-}
-
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.btnSecondary {
-  composes: btn;
-  background: var(--color-surface);
-  border-color: var(--color-border);
-  color: var(--color-text-secondary);
-}
-
-.btnSecondary:hover:not(:disabled) {
-  background: var(--color-surface-hover);
-  color: var(--color-text-primary);
-  border-color: #c9cdd6;
-}
-
-.btnPrimary {
-  composes: btn;
-  background: var(--color-accent);
-  color: #fff;
-}
-
-.btnPrimary:hover:not(:disabled) {
-  background: var(--color-accent-hover);
-}
-
-.btnDanger {
-  composes: btn;
-  background: var(--color-surface-error);
-  border-color: var(--color-border-error);
-  color: var(--color-text-error);
-}
-
-.btnDanger:hover:not(:disabled) {
-  background: var(--color-border-error);
+/* ---------------------------------------------------------------------------
+   Refresh button icon animation (used on the Refresh button in header)
+   --------------------------------------------------------------------------- */
+.refreshBtn {
+  /* Inherits from pageStyles.btnSecondary — no base styles needed */
 }
 
 .btnIcon {
@@ -120,6 +73,16 @@
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* ---------------------------------------------------------------------------
+   Initial loading center
+   --------------------------------------------------------------------------- */
+.loadingCenter {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 16rem;
 }
 
 /* ---------------------------------------------------------------------------
@@ -199,6 +162,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: block;
 }
 
 .cellValue {
@@ -208,6 +172,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: block;
 }
 
 .cellTtl {
@@ -320,25 +285,6 @@
 }
 
 /* ---------------------------------------------------------------------------
-   Header row (title + actions)
-   --------------------------------------------------------------------------- */
-.headerRow {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-  flex-wrap: wrap;
-}
-
-.headerActions {
-  display: flex;
-  align-items: center;
-  gap: 0.625rem;
-  flex-shrink: 0;
-  padding-top: 0.25rem;
-}
-
-/* ---------------------------------------------------------------------------
    Form fields (create / edit modal)
    --------------------------------------------------------------------------- */
 .formGroup {
@@ -411,6 +357,7 @@
 .fieldError {
   font-size: 0.75rem;
   color: var(--color-text-error);
+  margin-top: 0.25rem;
 }
 
 /* TTL input row */
@@ -529,15 +476,7 @@
     align-items: stretch;
   }
 
-  .headerRow {
-    flex-direction: column;
-  }
-
-  .headerActions {
-    padding-top: 0;
-  }
-
-  /* On narrow screens hide the Value column header/cells */
+  /* On narrow screens hide the Value and TTL columns */
   .colValue,
   .colTtl {
     display: none;

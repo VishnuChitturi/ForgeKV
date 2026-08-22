@@ -1,8 +1,9 @@
 // =============================================================================
 // StatGroup — a titled section containing a list of label/value stat rows.
 //
-// Used for the secondary "Operation Statistics" and "Persistence" sections
-// on the dashboard. Keeps DashboardPage.tsx free of repetitive markup.
+// Stage 19: Changed heading from h2 to h3. StatGroup is always rendered
+// inside a section that already has an h2 heading, so using h2 here creates
+// a duplicate same-level heading and breaks the document outline.
 // =============================================================================
 import styles from "./StatGroup.module.css";
 
@@ -19,7 +20,7 @@ interface StatGroupProps {
 export function StatGroup({ title, rows }: StatGroupProps) {
   return (
     <section className={styles.group} aria-label={title}>
-      <h2 className={styles.title}>{title}</h2>
+      <h3 className={styles.title}>{title}</h3>
       <dl className={styles.list}>
         {rows.map(({ label, value }) => (
           <div className={styles.row} key={label}>

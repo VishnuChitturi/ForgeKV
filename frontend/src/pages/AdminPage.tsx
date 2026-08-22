@@ -1,8 +1,15 @@
 // =============================================================================
 // AdminPage — ForgeKV Admin Dashboard (Stage 18: Analytics + Performance)
 //
-// Extends the Stage 17 operator dashboard with analytics and performance
-// visualization sections.
+// Stage 19 changes:
+//   - Page title corrected from "Analytics & Performance" to "Admin"
+//   - Benchmark initial state changed from "idle" to "loading" to avoid
+//     the brief flash of empty content before the useEffect fires.
+//   - Shared page-layout classes moved from AdminPage.module.css to
+//     Page.module.css to eliminate duplication with DashboardPage.
+//   - Section headings for AdminHealth, MaintenancePanel, SystemInfo are
+//     provided by the components themselves — AdminPage no longer adds
+//     duplicate h2s above them.
 //
 // SECTION LAYOUT:
 //   1. Page header           — title, description, refresh button, last-updated
@@ -19,11 +26,6 @@
 //   LIVE  — GET /health + GET /stats, refreshed manually.
 //   BENCH — /benchmark-results.json served from frontend/public/.
 //            Loaded once on mount. NOT re-run on refresh.
-//            Produced by: ./build/forgekv_benchmark --json-output
-//                         frontend/public/benchmark-results.json
-//
-// These two data sources are ALWAYS clearly separated in the UI.
-// Benchmark results are NEVER labeled as live metrics.
 // =============================================================================
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -72,10 +74,9 @@ export function AdminPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
 
-  // Benchmark data is loaded once on mount. It is NOT re-fetched on refresh.
-  const [benchState, setBenchState] = useState<BenchLoadState>({ status: "idle" });
+  // Initialised to "loading" to avoid the idle→loading flash on first render.
+  const [benchState, setBenchState] = useState<BenchLoadState>({ status: "loading" });
 
-  // Controls whether we show a full loading overlay vs subtle refresh state.
   const hasLoadedRef = useRef(false);
 
   const { toasts, addToast, dismissToast } = useToast();
@@ -84,7 +85,6 @@ export function AdminPage() {
   // Load benchmark artifact once on mount
   // -------------------------------------------------------------------------
   useEffect(() => {
-    setBenchState({ status: "loading" });
     loadBenchmarkResults().then((result) => {
       if (result.ok) {
         setBenchState({ status: "ready", data: result.data });
@@ -92,7 +92,7 @@ export function AdminPage() {
         setBenchState({ status: "unavailable", reason: result.reason });
       }
     });
-  }, []); // empty deps — only runs once; benchmarks are not re-run on refresh
+  }, []);
 
   // -------------------------------------------------------------------------
   // Fetch /health + /stats in parallel (live data only)
@@ -143,28 +143,29 @@ export function AdminPage() {
     <div className={pageStyles.page}>
       {/* ── Page header ── */}
       <header className={pageStyles.pageHeader}>
-        <div className={styles.headerRow}>
+        <div className={pageStyles.headerRow}>
           <div>
-            <h1 className={pageStyles.pageTitle}>Analytics &amp; Performance</h1>
+            <h1 className={pageStyles.pageTitle}>Admin</h1>
             <p className={pageStyles.pageDescription}>
-              Live server metrics and benchmark performance for the ForgeKV engine.
+              Operator console — live server metrics, maintenance controls, and
+              benchmark performance for the ForgeKV engine.
             </p>
           </div>
-          <div className={styles.headerActions}>
+          <div className={pageStyles.headerActions}>
             {lastUpdated !== null && (
-              <span className={styles.lastUpdated} aria-live="polite">
+              <span className={pageStyles.lastUpdated} aria-live="polite">
                 Live data: {formatLastUpdated(lastUpdated)}
               </span>
             )}
             <button
-              className={styles.refreshBtn}
+              className={pageStyles.refreshBtn}
               type="button"
               onClick={fetchData}
               disabled={refreshing || state.phase === "loading"}
               aria-label="Refresh live server metrics"
             >
               <span
-                className={refreshing ? styles.refreshIconSpin : styles.refreshIcon}
+                className={refreshing ? pageStyles.refreshIconSpin : pageStyles.refreshIcon}
                 aria-hidden="true"
               >
                 ↻
@@ -179,14 +180,14 @@ export function AdminPage() {
       <div className={pageStyles.pageBody}>
         {/* Initial load spinner */}
         {state.phase === "loading" && (
-          <div className={styles.loadingCenter}>
+          <div className={pageStyles.loadingCenter}>
             <Loading label="Loading admin dashboard…" size="lg" />
           </div>
         )}
 
         {/* Error on first load */}
         {state.phase === "error" && (
-          <div className={styles.errorWrapper}>
+          <div className={pageStyles.errorWrapper}>
             <ErrorMessage
               title="Unable to load ForgeKV statistics."
               message={state.message}
@@ -198,15 +199,17 @@ export function AdminPage() {
         {/* Ready state */}
         {state.phase === "ready" && (
           <div
-            className={`${styles.content} ${refreshing ? styles.contentRefreshing : ""}`}
+            className={`${pageStyles.content} ${refreshing ? pageStyles.contentRefreshing : ""}`}
           >
             {/* ── LIVE DATA SECTIONS ── */}
 
-            {/* Section: Server Health */}
-            <section aria-labelledby="section-health">
-              <h2 id="section-health" className={styles.sectionTitle}>
-                Server Health
-              </h2>
+            {/*
+              Section: Server Health
+              AdminHealth renders its own h2 internally, so we use a
+              visually-hidden label on the section only (aria-labelledby
+              still works via the internal heading id).
+            */}
+            <section aria-labelledby="admin-health-heading">
               <AdminHealth
                 serverStatus={state.serverStatus}
                 stats={state.stats}
@@ -215,10 +218,10 @@ export function AdminPage() {
 
             {/* Section: Live Operation Analytics */}
             <section aria-labelledby="section-analytics">
-              <h2 id="section-analytics" className={styles.sectionTitle}>
+              <h2 id="section-analytics" className={pageStyles.sectionTitle}>
                 Live Operation Analytics
               </h2>
-              <p className={styles.sectionDesc}>
+              <p className={pageStyles.sectionDesc}>
                 Cumulative counters since server start — refreshed manually.
               </p>
               <AnalyticsOverview stats={state.stats} />
@@ -226,7 +229,7 @@ export function AdminPage() {
 
             {/* Section: Persistence Analytics */}
             <section aria-labelledby="section-persist-analytics">
-              <h2 id="section-persist-analytics" className={styles.sectionTitle}>
+              <h2 id="section-persist-analytics" className={pageStyles.sectionTitle}>
                 Persistence Analytics
               </h2>
               <PersistenceAnalytics stats={state.stats} />
@@ -234,7 +237,7 @@ export function AdminPage() {
 
             {/* Section: Storage & Persistence (Stage 17 detail panels) */}
             <section aria-labelledby="section-storage">
-              <h2 id="section-storage" className={styles.sectionTitle}>
+              <h2 id="section-storage" className={pageStyles.sectionTitle}>
                 Storage &amp; Persistence
               </h2>
               <div className={styles.detailGrid}>
@@ -243,11 +246,11 @@ export function AdminPage() {
               </div>
             </section>
 
-            {/* Section: Maintenance */}
-            <section aria-labelledby="section-maintenance">
-              <h2 id="section-maintenance" className={styles.sectionTitle}>
-                Maintenance
-              </h2>
+            {/*
+              Section: Maintenance
+              MaintenancePanel renders its own h2 internally.
+            */}
+            <section aria-labelledby="maintenance-heading">
               <MaintenancePanel
                 onSuccess={fetchData}
                 addToast={addToast}
@@ -258,12 +261,17 @@ export function AdminPage() {
 
             {/* Section: Benchmark Performance */}
             <section aria-labelledby="section-benchmark">
-              <h2 id="section-benchmark" className={styles.sectionTitle}>
+              <h2 id="section-benchmark" className={pageStyles.sectionTitle}>
                 Benchmark Performance
               </h2>
 
-              {/* Always show the notice — distinguishes live vs benchmark */}
-              {benchState.status === "ready" ? (
+              {benchState.status === "loading" && (
+                <div className={styles.benchLoading}>
+                  <Loading label="Loading benchmark results…" size="sm" />
+                </div>
+              )}
+
+              {benchState.status === "ready" && (
                 <>
                   <BenchmarkNotice
                     generatedAt={benchState.data.generated_at}
@@ -277,23 +285,21 @@ export function AdminPage() {
                     <SnapshotCompactionPanel data={benchState.data} />
                   </div>
                 </>
-              ) : benchState.status === "unavailable" ? (
+              )}
+
+              {benchState.status === "unavailable" && (
                 <BenchmarkNotice
                   unavailable
                   reason={benchState.reason}
                 />
-              ) : (
-                <div className={styles.benchLoading}>
-                  <Loading label="Loading benchmark results…" size="sm" />
-                </div>
               )}
             </section>
 
-            {/* Section: System Information */}
-            <section aria-labelledby="section-sysinfo">
-              <h2 id="section-sysinfo" className={styles.sectionTitle}>
-                System Information
-              </h2>
+            {/*
+              Section: System Information
+              SystemInfo renders its own h2 internally.
+            */}
+            <section aria-labelledby="sysinfo-heading">
               <SystemInfo serverStatus={state.serverStatus} />
             </section>
           </div>
