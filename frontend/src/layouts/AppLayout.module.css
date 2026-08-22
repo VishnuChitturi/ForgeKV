@@ -1,0 +1,179 @@
+/* =============================================================================
+   AppLayout — full-screen shell with top bar + sidebar + main content
+   ============================================================================= */
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  overflow: hidden;
+}
+
+/* ---------------------------------------------------------------------------
+   Top bar
+   --------------------------------------------------------------------------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1.25rem;
+  height: var(--topbar-height);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+  z-index: 10;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.brandIcon {
+  font-size: 1.25rem;
+  color: var(--color-accent);
+  line-height: 1;
+  align-self: center;
+}
+
+.brandName {
+  font-size: 1.0625rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--color-text-primary);
+}
+
+.brandVersion {
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.topbarRight {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Body: sidebar + main
+   --------------------------------------------------------------------------- */
+.body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ---------------------------------------------------------------------------
+   Sidebar
+   --------------------------------------------------------------------------- */
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--color-surface);
+  border-right: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+
+.navList {
+  list-style: none;
+  margin: 0;
+  padding: 0.75rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  flex: 1;
+}
+
+.navItem {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-md);
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  text-decoration: none;
+  transition: background 0.12s, color 0.12s;
+}
+
+.navItem:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text-primary);
+}
+
+.navItemActive {
+  background: var(--color-accent-subtle);
+  color: var(--color-accent);
+}
+
+.navItemActive:hover {
+  background: var(--color-accent-subtle);
+  color: var(--color-accent);
+}
+
+.navIcon {
+  font-size: 1rem;
+  width: 1.25rem;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.navLabel {
+  flex: 1;
+}
+
+.sidebarFooter {
+  padding: 0.75rem 1.25rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.footerText {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+/* ---------------------------------------------------------------------------
+   Main content
+   --------------------------------------------------------------------------- */
+.main {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--color-bg);
+}
+
+/* ---------------------------------------------------------------------------
+   Responsive — collapse sidebar to icons-only below 640 px
+   --------------------------------------------------------------------------- */
+@media (max-width: 639px) {
+  .sidebar {
+    width: var(--sidebar-width-collapsed);
+  }
+
+  .navLabel,
+  .brandVersion,
+  .sidebarFooter {
+    display: none;
+  }
+
+  .navItem {
+    justify-content: center;
+    padding: 0.625rem;
+  }
+
+  .navIcon {
+    width: auto;
+    font-size: 1.125rem;
+  }
+
+  .brandName {
+    display: none;
+  }
+}

@@ -1,0 +1,154 @@
+/* =============================================================================
+   ForgeKV — Global styles and design token definitions
+   ============================================================================= */
+
+/* ---------------------------------------------------------------------------
+   CSS custom properties (design tokens) — light theme
+   --------------------------------------------------------------------------- */
+:root {
+  /* Layout */
+  --topbar-height: 3.25rem;
+  --sidebar-width: 13rem;
+  --sidebar-width-collapsed: 3.5rem;
+
+  /* Border radius */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.4375rem;
+  --radius-lg: 0.75rem;
+
+  /* Colors — backgrounds */
+  --color-bg:           #f8f9fb;
+  --color-surface:      #ffffff;
+  --color-surface-subtle: #f3f4f6;
+  --color-surface-hover:  #eef0f4;
+
+  /* Colors — borders */
+  --color-border:       #e4e7ec;
+
+  /* Colors — typography */
+  --color-text-primary:   #111827;
+  --color-text-secondary: #4b5563;
+  --color-text-muted:     #9ca3af;
+
+  /* Colors — accent (ForgeKV blue) */
+  --color-accent:        #2563eb;
+  --color-accent-subtle: #eff4ff;
+  --color-accent-hover:  #1d4ed8;
+
+  /* Colors — status: ok / connected */
+  --color-status-ok:      #16a34a;
+  --color-surface-ok:     #f0fdf4;
+  --color-border-ok:      #bbf7d0;
+  --color-text-ok:        #15803d;
+
+  /* Colors — status: error / offline */
+  --color-status-error:   #dc2626;
+  --color-surface-error:  #fef2f2;
+  --color-border-error:   #fecaca;
+  --color-text-error:     #b91c1c;
+
+  /* Colors — status: loading */
+  --color-status-loading: #f59e0b;
+
+  /* Shadows */
+  --shadow-sm:  0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md:  0 4px 6px -1px rgb(0 0 0 / 0.07), 0 2px 4px -1px rgb(0 0 0 / 0.05);
+
+  /* Typography */
+  --font-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+               Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace,
+               "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+}
+
+/* ---------------------------------------------------------------------------
+   Reset and base
+   --------------------------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  -webkit-text-size-adjust: 100%;
+  tab-size: 2;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 0.9375rem;
+  line-height: 1.6;
+  color: var(--color-text-primary);
+  background: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------------------------------------------------------------------------
+   Typography
+   --------------------------------------------------------------------------- */
+h1, h2, h3, h4, h5, h6 {
+  line-height: 1.3;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--color-text-primary);
+}
+
+p {
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+
+a {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code, pre, kbd, samp {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+}
+
+/* ---------------------------------------------------------------------------
+   Focus-visible ring
+   --------------------------------------------------------------------------- */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ---------------------------------------------------------------------------
+   Scrollbars (WebKit / Blink)
+   --------------------------------------------------------------------------- */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #c1c8d4;
+}

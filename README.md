@@ -20,10 +20,11 @@ A persistent, concurrent key-value storage engine built from scratch in C++20.
 9. [Project Structure](#project-structure)
 10. [Technology Stack](#technology-stack)
 11. [Building the Project](#building-the-project)
-12. [Testing Strategy](#testing-strategy)
-13. [Benchmarking Strategy](#benchmarking-strategy)
-14. [Learning Objectives](#learning-objectives)
-15. [Future Improvements](#future-improvements)
+12. [Frontend Dashboard](#frontend-dashboard)
+13. [Testing Strategy](#testing-strategy)
+14. [Benchmarking Strategy](#benchmarking-strategy)
+15. [Learning Objectives](#learning-objectives)
+16. [Future Improvements](#future-improvements)
 
 ---
 
@@ -149,6 +150,7 @@ Each component is introduced at the appropriate stage. The architecture is desig
 | 11    | Statistics              | ✅ Complete | Operational metrics and observability                    |
 | 12    | Benchmarking            | ✅ Complete | Throughput, latency, and resource benchmarks             |
 | 13    | Final Hardening         | ✅ Complete | 157 new tests: WAL/recovery/snapshot/TTL/concurrency hardening |
+| 14    | Frontend Foundation     | ✅ Complete | React/Vite/TypeScript dashboard shell, API client, routing |
 
 See the `docs/` directory for detailed design notes on each stage.
 
@@ -229,6 +231,49 @@ cmake --build build
 ```
 
 At Stage 0 there are no build targets. CMake configuration should succeed and print a status summary.
+
+---
+
+## Frontend Dashboard
+
+> **Status: Implemented (Stage 14)**
+
+ForgeKV ships a local web dashboard built with React, Vite, and TypeScript.
+
+**Prerequisites:** Node.js 18+, npm 8+.
+
+```bash
+cd frontend
+npm install
+npm run dev       # development server at http://localhost:5173
+npm run build     # production build → frontend/dist/
+npm run preview   # serve the production build locally
+```
+
+Start the ForgeKV backend before opening the dashboard:
+
+```bash
+./build/forgekv_server          # listens on 127.0.0.1:8080 by default
+```
+
+The Vite dev server proxies `/api/*` to the backend, so no CORS configuration
+is needed on the C++ server during development.
+
+**Routes:**
+
+| Path     | Page       | Status         |
+|----------|------------|----------------|
+| `/`      | Dashboard  | Placeholder    |
+| `/keys`  | Keys       | Placeholder    |
+| `/admin` | Admin      | Placeholder    |
+
+**Configuration:**
+
+Copy `frontend/.env.example` to `frontend/.env.local` and set
+`VITE_API_BASE_URL` if your backend runs on a non-default port.
+
+See `docs/14-frontend-foundation.md` for the full architecture, design
+decisions, and known limitations.
 
 ---
 
