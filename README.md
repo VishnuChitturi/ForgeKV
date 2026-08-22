@@ -15,16 +15,17 @@ ForgeKV implements durability guarantees from first principles: binary write-ahe
 5. [Project Structure](#project-structure)
 6. [Building the Backend](#building-the-backend)
 7. [Running ForgeKV](#running-forgekv)
-8. [HTTP API](#http-api)
-9. [Running the Frontend](#running-the-frontend)
-10. [Dashboard](#dashboard)
-11. [Benchmarking](#benchmarking)
-12. [Testing](#testing)
-13. [Persistence and Recovery](#persistence-and-recovery)
-14. [Design Decisions](#design-decisions)
-15. [Limitations](#limitations)
-16. [Future Improvements](#future-improvements)
-17. [Project Status](#project-status)
+8. [Deployment](#deployment)
+9. [HTTP API](#http-api)
+10. [Running the Frontend](#running-the-frontend)
+11. [Dashboard](#dashboard)
+12. [Benchmarking](#benchmarking)
+13. [Testing](#testing)
+14. [Persistence and Recovery](#persistence-and-recovery)
+15. [Design Decisions](#design-decisions)
+16. [Limitations](#limitations)
+17. [Future Improvements](#future-improvements)
+18. [Project Status](#project-status)
 
 ---
 
@@ -216,12 +217,20 @@ This produces:
 ## Running ForgeKV
 
 ```bash
-# Default: listens on 127.0.0.1:8080
+# Default: listens on 0.0.0.0:8080
 ./build/forgekv_server
 
-# Custom port
+# Custom port via positional argument
 ./build/forgekv_server 9090
+
+# Custom port via environment variable
+PORT=9090 ./build/forgekv_server
 ```
+
+Port selection precedence:
+1. Positional argument (`./forgekv_server 9090`) — highest priority
+2. `PORT` environment variable (`PORT=9090 ./forgekv_server`)
+3. Default: `8080`
 
 On startup the server:
 1. Constructs `KeyValueStore`, which opens `forgekv.wal` in the current working directory.
@@ -232,9 +241,40 @@ The WAL file (`forgekv.wal`) and snapshot file (`forgekv.wal.snapshot`) are writ
 
 ---
 
+## Deployment
+
+ForgeKV's HTTP server is deployment-ready for cloud platforms (e.g., Render, Railway, Fly.io) with no code changes required.
+
+**Host binding**
+
+The server binds to `0.0.0.0`, making it reachable on all network interfaces. This is required for containerized and cloud-hosted environments where the process must accept traffic on a platform-assigned address. For local access only, restrict access at the firewall or proxy level rather than changing the bind address.
+
+**PORT environment variable**
+
+Cloud platforms typically assign a port by injecting the `PORT` environment variable at runtime. ForgeKV reads `PORT` automatically:
+
+```bash
+PORT=10000 ./build/forgekv_server   # binds on port 10000
+```
+
+A positional argument overrides `PORT` when both are supplied. An invalid `PORT` value (non-numeric, or outside 0–65535) causes the process to exit immediately with a non-zero status and an error message on stderr.
+
+**Persistent storage**
+
+ForgeKV's WAL (`forgekv.wal`) and snapshot (`forgekv.wal.snapshot`) are written relative to the working directory at the time the server is launched. On platforms that provide an ephemeral filesystem, data will be lost on restart. To retain data across restarts, mount a persistent disk and launch the server from that directory:
+
+```bash
+cd /data   # persistent disk mount point
+/app/build/forgekv_server
+```
+
+If persistence across restarts is not required (e.g., a stateless demo), no special configuration is needed.
+
+---
+
 ## HTTP API
 
-All endpoints return `Content-Type: application/json`. The server binds to `127.0.0.1` only; there is no authentication.
+All endpoints return `Content-Type: application/json`. There is no authentication.
 
 ### Key operations
 
@@ -363,7 +403,7 @@ npm run dev       # development server at http://localhost:5173
 Start the ForgeKV backend first:
 
 ```bash
-./build/forgekv_server   # listens on 127.0.0.1:8080 by default
+./build/forgekv_server   # listens on 0.0.0.0:8080 by default
 ```
 
 The Vite dev server proxies all `/api/*` requests to `VITE_API_BASE_URL` (default `http://localhost:8080`), stripping the `/api` prefix before forwarding. No CORS configuration is needed on the C++ server during development.
