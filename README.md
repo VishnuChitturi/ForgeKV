@@ -2,8 +2,8 @@
 
 A persistent, concurrent key-value storage engine built from scratch in C++20.
 
-> **Status:** Stage 0 — Foundation. Repository structure and documentation in place.
-> No implementation exists yet. See the [Development Roadmap](#development-roadmap) for what is planned.
+> **Status:** Stage 12 — Benchmarking. KV engine, HTTP server, WAL, snapshots, compaction, TTL, statistics, and benchmark suite all implemented.
+> See the [Development Roadmap](#development-roadmap) for the full history.
 
 ---
 
@@ -147,7 +147,7 @@ Each component is introduced at the appropriate stage. The architecture is desig
 | 9     | Snapshots               | 🔲 Planned  | Periodic full-state checkpoints                          |
 | 10    | TTL / Expiration        | 🔲 Planned  | Key expiry with background cleanup                       |
 | 11    | Statistics              | 🔲 Planned  | Operational metrics and observability                    |
-| 12    | Benchmarking            | 🔲 Planned  | Throughput, latency, and resource benchmarks             |
+| 12    | Benchmarking            | ✅ Complete | Throughput, latency, and resource benchmarks             |
 | 13    | Testing                 | 🔲 Planned  | Unit, integration, persistence, concurrency, stress tests|
 
 See the `docs/` directory for detailed design notes on each stage.
@@ -253,20 +253,21 @@ The test suite will be introduced progressively, with tests added as each stage 
 
 ## Benchmarking Strategy
 
-> **Status: Planned (Stage 12)**
+> **Status: Implemented (Stage 12)**
 
-ForgeKV will include a benchmark suite measuring actual, reproducible performance on real hardware. No numbers are invented or estimated in advance.
+ForgeKV includes a benchmark suite measuring actual, reproducible performance on real hardware. No numbers are invented or estimated in advance.
 
-Metrics to be measured:
+Metrics measured:
 
 - GET / SET / DELETE throughput (operations per second)
 - Average, P50, P95, and P99 latency
-- Memory usage vs. dataset size
 - WAL file size vs. operation count
-- Recovery time from WAL
 - Compaction time and space savings
+- Snapshot time and file size
+- Concurrency scalability (1, 2, 4, 8 threads)
+- HTTP-level throughput (GET, PUT, mixed)
 
-Results will be documented only after measurement with the actual implementation.
+Results are obtained by running `./build/forgekv_benchmark`. See `docs/12-benchmarking.md` for full details.
 
 ---
 

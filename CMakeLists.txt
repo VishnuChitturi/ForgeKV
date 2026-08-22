@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(
     ForgeKV
-    VERSION 0.11.0
+    VERSION 0.12.0
     DESCRIPTION "A persistent, concurrent key-value storage engine built from scratch in C++20"
     LANGUAGES CXX
 )
@@ -142,25 +142,61 @@ add_executable(forgekv_demo1
 target_link_libraries(forgekv_demo1 PRIVATE forgekv_core)
 
 # ---------------------------------------------------------------------------
+# forgekv_benchmark — Stage 12: Benchmark suite
+# ---------------------------------------------------------------------------
+#
+# Standalone benchmark executable. NOT added to CTest — benchmarks are not
+# unit tests and should not run automatically in CI or during normal testing.
+#
+# Run manually:
+#   ./build/forgekv_benchmark
+#   ./build/forgekv_benchmark --operations 50000 --threads 4
+#   ./build/forgekv_benchmark --output results.csv
+#   ./build/forgekv_benchmark --help
+#
+# The benchmark links forgekv_core (KV engine) and includes http_server.cpp
+# directly (for the HTTP benchmark). It also needs the httplib include path.
+
+add_executable(forgekv_benchmark
+    benchmarks/benchmark_main.cpp
+    benchmarks/benchmark_kv_store.cpp
+    benchmarks/benchmark_http.cpp
+    src/http_server.cpp            # HttpServer implementation (for HTTP bench)
+)
+
+target_link_libraries(forgekv_benchmark PRIVATE forgekv_core)
+
+# Benchmark binary includes:
+#   - benchmarks/ for bench_harness.h
+#   - third_party/httplib for httplib.h (HTTP benchmark client + server)
+target_include_directories(forgekv_benchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/benchmarks
+    ${CMAKE_SOURCE_DIR}/third_party/httplib
+)
+
+# cpp-httplib uses std::thread; std::barrier also needs pthreads.
+find_package(Threads REQUIRED)
+target_link_libraries(forgekv_benchmark PRIVATE Threads::Threads)
+
+# Benchmarks are NOT registered with CTest.
+# Do NOT add_test() for forgekv_benchmark.
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 message(STATUS "")
 message(STATUS "Targets configured:")
 message(STATUS "  forgekv_core       — static library (kv_store.cpp, in_memory_storage.cpp, wal.cpp, recovery.cpp, snapshot.cpp)")
-message(STATUS "  forgekv_tests      — test binary    (tests/test_kv_store.cpp)  [Stage 1–11]")
-message(STATUS "  forgekv_server     — HTTP server    (src/http_server.cpp, src/main.cpp)  [Stage 6–11]")
-message(STATUS "  forgekv_http_tests — HTTP tests     (tests/test_http_server.cpp)          [Stage 6–11]")
+message(STATUS "  forgekv_tests      — test binary    (tests/test_kv_store.cpp)  [Stage 1–12]")
+message(STATUS "  forgekv_server     — HTTP server    (src/http_server.cpp, src/main.cpp)  [Stage 6–12]")
+message(STATUS "  forgekv_http_tests — HTTP tests     (tests/test_http_server.cpp)          [Stage 6–12]")
+message(STATUS "  forgekv_benchmark  — benchmark      (benchmarks/)  [Stage 12]  — NOT in CTest")
 message(STATUS "  forgekv_demo       — demo binary    (examples/demo.cpp)")
 message(STATUS "  forgekv_demo1      — demo binary    (examples/demo1.cpp)")
 message(STATUS "")
-message(STATUS "Build:        cmake --build build")
-message(STATUS "Run tests:    ctest --test-dir build --output-on-failure")
-message(STATUS "Run server:   ./build/forgekv_server [port]")
-message(STATUS "Run demo:     ./build/forgekv_demo")
+message(STATUS "Build:           cmake --build build")
+message(STATUS "Run tests:       ctest --test-dir build --output-on-failure")
+message(STATUS "Run server:      ./build/forgekv_server [port]")
+message(STATUS "Run benchmark:   ./build/forgekv_benchmark [--help]")
+message(STATUS "Run demo:        ./build/forgekv_demo")
 message(STATUS "")
-
-# ---------------------------------------------------------------------------
-# Future subdirectory stubs (uncommented as each stage is implemented)
-# ---------------------------------------------------------------------------
-# Stage 4+:  binary WAL, recovery, HTTP, concurrency, snapshots, compaction, TTL
-# Stage 12:  add_subdirectory(benchmarks)
