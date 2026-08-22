@@ -61,6 +61,30 @@ export interface ErrorResponse {
 }
 
 // ---------------------------------------------------------------------------
+// GET /keys → 200   (Stage 16)
+//
+// ttl_seconds semantics (matching backend KeyValueStore::kTtlPermanent):
+//   -1.0   → permanent key (no TTL)
+//   >= 0.0 → remaining seconds until expiry
+// ---------------------------------------------------------------------------
+export interface KeyInfo {
+  key: string;
+  value: string;
+  /** -1 = permanent; ≥ 0 = remaining seconds */
+  ttl_seconds: number;
+}
+
+export interface KeyListResponse {
+  keys: KeyInfo[];
+  /** Total matched keys before pagination */
+  total: number;
+  /** Effective page size used */
+  limit: number;
+  /** Effective offset used */
+  offset: number;
+}
+
+// ---------------------------------------------------------------------------
 // Discriminated union for callers that need to distinguish success/failure
 // ---------------------------------------------------------------------------
 export type ApiResult<T> =

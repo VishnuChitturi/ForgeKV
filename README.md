@@ -2,7 +2,7 @@
 
 A persistent, concurrent key-value storage engine built from scratch in C++20.
 
-> **Status:** Stage 15 — Dashboard. Real /health + /stats dashboard with server overview, summary cards, statistics tables, and responsive layout.
+> **Status:** Stage 16 — Key Management. Full CRUD key browser: GET /keys API, prefix filtering, pagination, create/edit/delete/view modals, TTL management, toast notifications, URL state, responsive layout.
 > See the [Development Roadmap](#development-roadmap) for the full history.
 
 ---
@@ -152,6 +152,7 @@ Each component is introduced at the appropriate stage. The architecture is desig
 | 13    | Final Hardening         | ✅ Complete | 157 new tests: WAL/recovery/snapshot/TTL/concurrency hardening |
 | 14    | Frontend Foundation     | ✅ Complete | React/Vite/TypeScript dashboard shell, API client, routing |
 | 15    | Dashboard               | ✅ Complete | Real /health + /stats dashboard: overview, cards, stats, formatting |
+| 16    | Key Management          | ✅ Complete | GET /keys API, prefix filter, pagination, full CRUD UI, TTL, toasts |
 
 See the `docs/` directory for detailed design notes on each stage.
 
@@ -265,7 +266,7 @@ is needed on the C++ server during development.
 | Path     | Page       | Status                   |
 |----------|------------|--------------------------|
 | `/`      | Dashboard  | ✅ Implemented (Stage 15) |
-| `/keys`  | Keys       | Placeholder              |
+| `/keys`  | Keys       | ✅ Implemented (Stage 16) |
 | `/admin` | Admin      | Placeholder              |
 
 **Configuration:**
@@ -282,7 +283,7 @@ decisions, and known limitations.
 
 > **Status: Implemented (Stage 13)**
 
-ForgeKV includes a comprehensive test suite of **412 tests** across 12 CTest targets covering:
+ForgeKV includes a comprehensive test suite of **433 tests** across 13 CTest targets covering:
 
 - **Unit tests** — individual components in isolation (store, WAL, recovery, TTL)
 - **Integration tests** — components working together end-to-end
@@ -296,6 +297,7 @@ ForgeKV includes a comprehensive test suite of **412 tests** across 12 CTest tar
 - **Compaction tests** — state invariants before and after, interaction with snapshots and TTL
 - **TTL tests** — boundary conditions, persistence, expiry across restart
 - **HTTP edge-case tests** — status codes, special characters, concurrent requests
+- **GET /keys tests** — pagination, prefix filter, ordering, TTL metadata, expired keys, concurrency
 - **Boundary/input tests** — empty keys, large values, binary-safe strings, Unicode
 - **Lifecycle tests** — resource cleanup, temp file removal, server start/stop
 - **Randomized tests** — fixed-seed state-machine comparison against a reference model

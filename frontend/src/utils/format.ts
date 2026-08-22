@@ -96,3 +96,37 @@ export function formatLastUpdated(ts: number | null): string {
   if (diffMs < 3_600_000) return `${Math.floor(diffMs / 60_000)}m ago`;
   return new Date(ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
 }
+
+/**
+ * formatTtl — human-readable TTL for a key.
+ *
+ * ttl_seconds semantics from the backend:
+ *   -1   → permanent (no TTL)
+ *   >= 0 → remaining seconds
+ *
+ * Examples:
+ *   -1     → "Permanent"
+ *   0      → "Expiring…"
+ *   45     → "45s"
+ *   134    → "2m 14s"
+ *   3601   → "1h 0m"
+ */
+export function formatTtl(ttl_seconds: number): string {
+  if (ttl_seconds < 0) return "Permanent";
+  if (ttl_seconds < 1) return "Expiring…";
+  return formatUptime(ttl_seconds);
+}
+
+/**
+ * truncateValue — shorten a long value string for table display.
+ *
+ * Returns at most maxLen visible characters, appending "…" if truncated.
+ * Newlines are replaced with a visible marker so the table stays single-line.
+ * The original value is NEVER modified.
+ */
+export function truncateValue(value: string, maxLen = 80): string {
+  // Replace newlines with a visible marker for single-line display.
+  const oneLine = value.replace(/\n/g, "↵").replace(/\r/g, "");
+  if (oneLine.length <= maxLen) return oneLine;
+  return oneLine.slice(0, maxLen) + "…";
+}

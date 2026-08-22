@@ -60,7 +60,7 @@ export function AppLayout() {
           </ul>
 
           <footer className={styles.sidebarFooter}>
-            <span className={styles.footerText}>ForgeKV&nbsp;·&nbsp;Stage&nbsp;15</span>
+            <span className={styles.footerText}>ForgeKV&nbsp;·&nbsp;Stage&nbsp;16</span>
           </footer>
         </nav>
 

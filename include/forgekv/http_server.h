@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// ForgeKV — Stage 7: HttpServer (Concurrent Request Handling)
+// ForgeKV — Stage 16: HttpServer (Key Management API)
 // =============================================================================
 //
 // HttpServer is a thin HTTP translation layer on top of the ForgeKV engine.
@@ -24,32 +24,41 @@
 //       ▼
 //   WAL + InMemoryStorage
 //
-// REST API (unchanged from Stage 6):
+// REST API:
 //
 //   GET    /key/<key>   → 200 {"key":"...","value":"..."}
 //                         404 {"error":"key not found"}
 //
 //   PUT    /key/<key>   → 200 {"status":"ok"}
 //         body: plain-text value
+//         optional header: X-TTL-Seconds: <seconds>
 //
 //   DELETE /key/<key>   → 200 {"status":"ok"}
 //                         404 {"error":"key not found"}
 //
 //   GET    /health      → 200 {"status":"ok"}
 //
-// Concurrent operation (Stage 7):
+//   GET    /stats       → 200 { ...metrics... }
 //
-//   Stage 6 used an InlineTaskQueue that ran every request handler directly
-//   on the accept-loop thread, making the server fully single-threaded.
+//   GET    /keys        → 200 { "keys": [...], "total": N, "limit": L, "offset": O }
+//         optional query params:
+//           prefix  — only return keys starting with this string (default: "")
+//           limit   — max keys to return (default: 50, max: 100)
+//           offset  — how many keys to skip (default: 0)
+//         Keys are sorted lexicographically. Only live (non-expired) keys appear.
+//         400 on invalid limit / offset.
 //
-//   Stage 7 removes that constraint. The server now uses cpp-httplib's
-//   default ThreadPool task queue. Each incoming connection is dispatched to
-//   a worker thread from the pool, allowing multiple requests to be handled
-//   concurrently.
+// Key list entry shape:
+//   {
+//     "key":         "<string>",
+//     "value":       "<string>",
+//     "ttl_seconds": <number>   // -1.0 = permanent, >= 0 = remaining seconds
+//   }
 //
-//   Thread safety is guaranteed by KeyValueStore's std::shared_mutex:
-//     - Concurrent GET/health requests acquire shared locks (readers).
-//     - Concurrent PUT/DELETE requests acquire exclusive locks (writers).
+// Concurrent operation (Stage 7+):
+//
+//   The server uses cpp-httplib's default ThreadPool task queue.
+//   Thread safety is guaranteed by KeyValueStore's std::shared_mutex.
 //
 // JSON serialization:
 //
@@ -72,6 +81,7 @@
 #include "httplib.h"
 
 #include <string>
+#include <vector>
 
 namespace forgekv {
 
@@ -175,6 +185,17 @@ private:
     // Example: json_kv("foo", "bar") → {"key":"foo","value":"bar"}
     static std::string json_kv(const std::string& key,
                                const std::string& value);
+
+    // Build the GET /keys JSON response body.
+    // entries: list of KeyValueStore::KeyInfo items (key, value, ttl_seconds).
+    //   ttl_seconds: -1.0 = permanent; >=0.0 = remaining seconds.
+    // total: total matched keys before pagination.
+    // limit, offset: the pagination parameters echoed back.
+    static std::string json_keys_response(
+        const std::vector<KeyValueStore::KeyInfo>& entries,
+        std::size_t total,
+        std::size_t limit,
+        std::size_t offset);
 
     // -------------------------------------------------------------------------
     // State

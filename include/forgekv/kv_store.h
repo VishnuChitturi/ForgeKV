@@ -74,12 +74,14 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace forgekv {
 
@@ -228,6 +230,33 @@ public:
     // Atomic counters are read without the storage lock (relaxed order).
     // Returns a Stats struct by value — safe to use after the lock is released.
     [[nodiscard]] Stats stats() const;
+
+    // -------------------------------------------------------------------------
+    // Stage 16: Key listing (for GET /keys HTTP endpoint)
+    // -------------------------------------------------------------------------
+
+    // LIST_KEYS: Return metadata for all live (non-expired) keys.
+    //
+    // now_us: current time in microseconds since Unix epoch. Pass 0 to
+    //         include all entries regardless of expiration (raw dump).
+    //         Normally pass the wall-clock timestamp of the request.
+    //
+    // Returns a vector of KeyInfo structs — one per live key — sorted by
+    // the CALLER (HttpServer sorts lexicographically).
+    //
+    // ttl_seconds in each entry:
+    //   -1.0  → key is permanent (no TTL)
+    //   ≥ 0.0 → seconds remaining until expiry (truncated toward zero)
+    //
+    // Acquires the shared lock for the snapshot duration; does NOT hold it
+    // after returning. Concurrent PUT/DELETE remain safe.
+    struct KeyInfo {
+        std::string key;
+        std::string value;
+        double      ttl_seconds; // -1.0 = permanent; >=0 = remaining
+    };
+
+    [[nodiscard]] std::vector<KeyInfo> list_keys(std::uint64_t now_us) const;
 
 private:
     // -------------------------------------------------------------------------

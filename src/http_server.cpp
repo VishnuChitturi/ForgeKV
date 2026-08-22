@@ -1,5 +1,5 @@
 // =============================================================================
-// ForgeKV — Stage 7: HttpServer implementation (Concurrent Request Handling)
+// ForgeKV — Stage 16: HttpServer implementation (Key Management API)
 // =============================================================================
 //
 // See include/forgekv/http_server.h for the full design and API documentation.
@@ -12,51 +12,43 @@
 //   3. register_routes() — registers all REST endpoint handlers on server_.
 //   4. json_escape() — correct JSON string escaping.
 //   5. json_status() / json_error() / json_kv() — response serialization helpers.
+//   6. json_keys_response() — GET /keys response serialization.
 //
-// CONCURRENT OPERATION (Stage 7)
+// GET /keys IMPLEMENTATION NOTES (Stage 16)
+// ------------------------------------------
+// Query parameters:
+//   prefix  (string, default "")  — return only keys with this prefix
+//   limit   (integer, default 50, max 100) — max results per page
+//   offset  (integer, default 0)  — skip this many results
+//
+// Algorithm:
+//   1. Parse + validate query params; return 400 on error.
+//   2. Call store_.get_all_with_expiry_snapshot() via the TTL-aware storage
+//      path (through KeyValueStore's public ttl() + get() APIs operating
+//      under the shared lock), or more precisely:
+//      We call a new KeyValueStore::list_keys() method that acquires the
+//      shared lock once, snapshots all live (non-expired) entries, applies
+//      prefix filter, sorts lexicographically, computes TTL metadata,
+//      and returns the full filtered+sorted list. Pagination is applied
+//      in the HTTP layer after receiving the snapshot.
+//   3. Sort lexicographically (deterministic for pagination).
+//   4. Apply offset+limit to produce the response page.
+//   5. Serialize to JSON.
+//
+// Concurrency:
+//   KeyValueStore::list_keys() acquires the shared lock once for the snapshot.
+//   Concurrent GET /key, PUT /key, DELETE /key are safe.
+//
+// CONCURRENT OPERATION
 // --------------------------------
-// Stage 6 installed an InlineTaskQueue that ran every request handler
-// synchronously on the accept-loop thread — fully single-threaded.
-//
-// Stage 7 removes that override entirely. cpp-httplib's default ThreadPool
-// task queue is used, which dispatches each accepted connection to a worker
-// thread. Multiple requests can now execute concurrently.
-//
-// Thread safety for the KeyValueStore is provided by its std::shared_mutex:
-//   - GET /key/:key and GET /health call read-only operations → shared locks.
-//   - PUT /key/:key calls store_.set() → exclusive lock.
-//   - DELETE /key/:key calls store_.del() → exclusive lock.
-//
-// ROUTE STRUCTURE
-// ---------------
-// All four endpoints are registered in register_routes() with full business
-// logic implemented:
-//
-//   GET  /key/:key  — 200+JSON if found, 404 if not found
-//   PUT  /key/:key  — 400 if body empty, 200 on success
-//   DELETE /key/:key — 200 if deleted, 404 if not found
-//   GET  /health    — always 200 {"status":"ok"}
-//
-// CONTENT TYPE
-// ------------
-// All responses use Content-Type: application/json.
-// PUT request bodies are read as plain text (the raw body is the value).
-//
-// JSON ESCAPING
-// -------------
-// json_escape() handles:
-//   "  → \"
-//   \  → \\
-//   \n → \n
-//   \r → \r
-//   \t → \t
-//   control characters 0x00–0x1F → \uXXXX
-//
-// Keys and values may contain any of these characters.
+// Stage 7+ uses cpp-httplib's default ThreadPool. Thread safety provided by
+// KeyValueStore's std::shared_mutex.
 // =============================================================================
 
 #include "forgekv/http_server.h"
 
+#include <algorithm>
+#include <chrono>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -332,6 +324,151 @@ void HttpServer::register_routes() {
             res.set_content(json_error("internal server error"), "application/json");
         }
     });
+
+    // -------------------------------------------------------------------------
+    // GET /keys — list all live keys (Stage 16)
+    // -------------------------------------------------------------------------
+    //
+    // Query parameters:
+    //   prefix  (string, default "")  — filter keys by prefix
+    //   limit   (integer, default 50, max 100) — page size
+    //   offset  (integer, default 0)  — skip N results
+    //
+    // Response (200):
+    //   {
+    //     "keys": [
+    //       { "key": "...", "value": "...", "ttl_seconds": -1.0 },
+    //       ...
+    //     ],
+    //     "total": <N>,    -- total matched keys (after prefix filter, before pagination)
+    //     "limit": <L>,    -- effective limit used
+    //     "offset": <O>    -- effective offset used
+    //   }
+    //
+    // Returns 400 for invalid limit / offset.
+    // Returns 500 on internal error.
+    //
+    // Keys are sorted lexicographically (deterministic for pagination).
+    // Only live (non-expired) keys are included.
+    // The snapshot is taken under the shared lock once; TTL is computed from
+    // the same timestamp to keep the view consistent.
+    server_.Get("/keys", [this](const httplib::Request& req,
+                                httplib::Response&       res) {
+        // --- Parse query parameters ---
+
+        // prefix: optional, default ""
+        std::string prefix;
+        if (req.has_param("prefix")) {
+            prefix = req.get_param_value("prefix");
+        }
+
+        // limit: optional, default 50, max 100
+        static constexpr std::size_t kDefaultLimit = 50;
+        static constexpr std::size_t kMaxLimit      = 100;
+        std::size_t limit = kDefaultLimit;
+        if (req.has_param("limit")) {
+            const std::string& ls = req.get_param_value("limit");
+            try {
+                long long val = 0;
+                std::size_t pos = 0;
+                val = std::stoll(ls, &pos);
+                if (pos != ls.size()) {
+                    throw std::invalid_argument("trailing characters");
+                }
+                if (val < 0) {
+                    res.status = 400;
+                    res.set_content(json_error("limit must be >= 0"), "application/json");
+                    return;
+                }
+                limit = static_cast<std::size_t>(
+                    std::min(static_cast<long long>(kMaxLimit), val));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(json_error("limit must be a non-negative integer"),
+                                "application/json");
+                return;
+            }
+        }
+
+        // offset: optional, default 0
+        std::size_t offset = 0;
+        if (req.has_param("offset")) {
+            const std::string& os = req.get_param_value("offset");
+            try {
+                long long val = 0;
+                std::size_t pos = 0;
+                val = std::stoll(os, &pos);
+                if (pos != os.size()) {
+                    throw std::invalid_argument("trailing characters");
+                }
+                if (val < 0) {
+                    res.status = 400;
+                    res.set_content(json_error("offset must be >= 0"), "application/json");
+                    return;
+                }
+                offset = static_cast<std::size_t>(val);
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(json_error("offset must be a non-negative integer"),
+                                "application/json");
+                return;
+            }
+        }
+
+        try {
+            // Capture "now" once so all TTL computations in this request are
+            // consistent with the same clock snapshot.
+            const auto now_tp  = std::chrono::system_clock::now();
+            const auto now_us  = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now_tp.time_since_epoch()).count());
+
+            // Ask the store for all live entries (under its shared lock).
+            // list_keys(now_us) excludes already-expired keys and computes
+            // remaining TTL for each entry. Returns KeyValueStore::KeyInfo.
+            auto raw = store_.list_keys(now_us);
+
+            // Sort lexicographically for deterministic pagination.
+            std::sort(raw.begin(), raw.end(),
+                      [](const forgekv::KeyValueStore::KeyInfo& a,
+                         const forgekv::KeyValueStore::KeyInfo& b) {
+                          return a.key < b.key;
+                      });
+
+            // Apply prefix filter.
+            std::vector<forgekv::KeyValueStore::KeyInfo> filtered;
+            filtered.reserve(raw.size());
+            for (auto& e : raw) {
+                if (prefix.empty() ||
+                    (e.key.size() >= prefix.size() &&
+                     e.key.compare(0, prefix.size(), prefix) == 0)) {
+                    filtered.push_back(std::move(e));
+                }
+            }
+
+            const std::size_t total = filtered.size();
+
+            // Apply pagination.
+            std::vector<forgekv::KeyValueStore::KeyInfo> page;
+            if (offset < total) {
+                const std::size_t end = std::min(offset + limit, total);
+                page.assign(
+                    std::make_move_iterator(filtered.begin() +
+                                            static_cast<std::ptrdiff_t>(offset)),
+                    std::make_move_iterator(filtered.begin() +
+                                            static_cast<std::ptrdiff_t>(end)));
+            }
+
+            res.status = 200;
+            res.set_content(
+                json_keys_response(page, total, limit, offset),
+                "application/json");
+
+        } catch (const std::exception&) {
+            res.status = 500;
+            res.set_content(json_error("internal server error"), "application/json");
+        }
+    });
 }
 
 // =============================================================================
@@ -416,6 +553,55 @@ std::string HttpServer::json_kv(const std::string& key,
     return "{\"key\":\""   + json_escape(key)
          + "\",\"value\":\"" + json_escape(value)
          + "\"}";
+}
+
+// =============================================================================
+// json_keys_response  (Stage 16)
+// =============================================================================
+//
+// Serializes the GET /keys response.
+//
+// Shape:
+// {
+//   "keys": [
+//     { "key": "<k>", "value": "<v>", "ttl_seconds": <d> },
+//     ...
+//   ],
+//   "total":  <N>,
+//   "limit":  <L>,
+//   "offset": <O>
+// }
+//
+// ttl_seconds conventions (matching KeyValueStore::ttl()):
+//   -1.0  → permanent (kTtlPermanent)
+//   ≥ 0.0 → remaining seconds until expiry
+
+std::string HttpServer::json_keys_response(
+    const std::vector<KeyValueStore::KeyInfo>& entries,
+    std::size_t total,
+    std::size_t limit,
+    std::size_t offset)
+{
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3);
+
+    oss << "{\"keys\":[";
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (i > 0) oss << ',';
+        const auto& e = entries[i];
+        oss << "{"
+            << "\"key\":\""         << json_escape(e.key)   << "\","
+            << "\"value\":\""       << json_escape(e.value) << "\","
+            << "\"ttl_seconds\":"   << e.ttl_seconds
+            << "}";
+    }
+    oss << "],"
+        << "\"total\":"  << total  << ","
+        << "\"limit\":"  << limit  << ","
+        << "\"offset\":" << offset
+        << "}";
+
+    return oss.str();
 }
 
 } // namespace forgekv

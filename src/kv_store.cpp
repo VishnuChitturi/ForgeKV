@@ -679,4 +679,56 @@ Stats KeyValueStore::stats() const
     return s;
 }
 
+// =============================================================================
+// list_keys  (Stage 16)
+// =============================================================================
+//
+// Returns metadata for all live (non-expired) keys as a snapshot.
+//
+// Algorithm:
+//   1. Acquire the shared lock.
+//   2. Call storage_->get_all_with_expiry(now_us) to get all live entries
+//      (already excludes expired keys based on now_us).
+//   3. For each entry compute the remaining TTL in seconds:
+//        - expires_at_us == 0  → permanent (-1.0)
+//        - expires_at_us > 0   → (expires_at_us - now_us) / 1e6  (>= 0.0)
+//   4. Release lock and return the vector.
+//
+// Caller (HttpServer) sorts lexicographically and applies pagination.
+
+std::vector<KeyValueStore::KeyInfo>
+KeyValueStore::list_keys(std::uint64_t now_us) const
+{
+    std::vector<KeyInfo> result;
+
+    std::shared_lock lock(mutex_);
+
+    auto raw = storage_->get_all_with_expiry(now_us);
+    result.reserve(raw.size());
+
+    for (auto& [k, entry] : raw) {
+        double ttl_sec;
+        if (entry.expires_at_us == 0) {
+            // Permanent key — no TTL.
+            ttl_sec = -1.0;
+        } else if (entry.expires_at_us > now_us) {
+            // Live expiring key — compute remaining seconds.
+            const std::uint64_t remaining_us = entry.expires_at_us - now_us;
+            ttl_sec = static_cast<double>(remaining_us) / 1'000'000.0;
+        } else {
+            // Already expired (get_all_with_expiry should not return these
+            // when now_us > 0, but be defensive).
+            ttl_sec = 0.0;
+        }
+
+        result.push_back(KeyInfo{
+            std::move(k),
+            std::move(entry.value),
+            ttl_sec
+        });
+    }
+
+    return result;
+}
+
 } // namespace forgekv

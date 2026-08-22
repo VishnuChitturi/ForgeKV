@@ -173,6 +173,22 @@ target_include_directories(forgekv_http_tests PRIVATE
 add_test(NAME forgekv_http_all_tests COMMAND forgekv_http_tests)
 
 # ---------------------------------------------------------------------------
+# forgekv_tests_http_keys — Stage 16: GET /keys integration tests
+# ---------------------------------------------------------------------------
+
+add_executable(forgekv_tests_http_keys
+    tests/test_http_keys.cpp
+    src/http_server.cpp
+)
+
+target_link_libraries(forgekv_tests_http_keys PRIVATE forgekv_core Threads::Threads)
+target_include_directories(forgekv_tests_http_keys PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/httplib
+)
+
+add_test(NAME forgekv_http_keys_tests COMMAND forgekv_tests_http_keys)
+
+# ---------------------------------------------------------------------------
 # forgekv_server — Stage 6: HTTP server binary
 # ---------------------------------------------------------------------------
 
@@ -265,6 +281,7 @@ message(STATUS "Targets configured:")
 message(STATUS "  forgekv_core             — static library")
 message(STATUS "  forgekv_tests            — baseline KV tests (Stage 1-12, 218 tests)")
 message(STATUS "  forgekv_http_tests       — HTTP integration tests (37 tests)")
+message(STATUS "  forgekv_tests_http_keys  — GET /keys integration tests (Stage 16, 21 tests)")
 message(STATUS "  forgekv_tests_wal        — WAL robustness tests (22 tests)")
 message(STATUS "  forgekv_tests_recovery   — Recovery hardening tests (15 tests)")
 message(STATUS "  forgekv_tests_snapshot   — Snapshot hardening tests (20 tests)")

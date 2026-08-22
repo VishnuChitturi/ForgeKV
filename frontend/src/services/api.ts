@@ -20,6 +20,7 @@ import type {
   DeleteKeyResponse,
   GetKeyResponse,
   HealthResponse,
+  KeyListResponse,
   SetKeyResponse,
   StatsResponse,
 } from "../types/api";
@@ -137,4 +138,39 @@ export function deleteKey(key: string): Promise<ApiResult<DeleteKeyResponse>> {
   return request<DeleteKeyResponse>(`/key/${encodeURIComponent(key)}`, {
     method: "DELETE",
   });
+}
+
+// ---------------------------------------------------------------------------
+// Stage 16: Key Management API
+// ---------------------------------------------------------------------------
+
+export interface ListKeysOptions {
+  /** Only return keys starting with this string. Default: "" (all keys). */
+  prefix?: string;
+  /** Maximum keys to return. Default: 50, max: 100. */
+  limit?: number;
+  /** Keys to skip. Default: 0. */
+  offset?: number;
+}
+
+/**
+ * GET /keys
+ * Returns paginated key list with TTL metadata.
+ * Supports optional prefix filtering and limit/offset pagination.
+ */
+export function listKeys(
+  options: ListKeysOptions = {}
+): Promise<ApiResult<KeyListResponse>> {
+  const params = new URLSearchParams();
+  if (options.prefix !== undefined && options.prefix !== "") {
+    params.set("prefix", options.prefix);
+  }
+  if (options.limit !== undefined) {
+    params.set("limit", String(options.limit));
+  }
+  if (options.offset !== undefined && options.offset > 0) {
+    params.set("offset", String(options.offset));
+  }
+  const qs = params.toString();
+  return request<KeyListResponse>(`/keys${qs ? `?${qs}` : ""}`);
 }

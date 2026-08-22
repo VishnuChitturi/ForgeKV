@@ -1,0 +1,550 @@
+/* =============================================================================
+   KeysPage — Stage 16
+   ============================================================================= */
+
+/* ---------------------------------------------------------------------------
+   Toolbar: search field + buttons
+   --------------------------------------------------------------------------- */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+}
+
+.searchWrap {
+  flex: 1 1 14rem;
+  position: relative;
+  min-width: 10rem;
+}
+
+.searchIcon {
+  position: absolute;
+  left: 0.7rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--color-text-muted);
+  font-size: 0.9rem;
+  pointer-events: none;
+  user-select: none;
+}
+
+.searchInput {
+  width: 100%;
+  padding: 0.4375rem 0.75rem 0.4375rem 2rem;
+  font-size: 0.875rem;
+  font-family: var(--font-mono);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.searchInput:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgb(37 99 235 / 0.12);
+}
+
+.searchInput::placeholder {
+  color: var(--color-text-muted);
+  font-family: var(--font-sans);
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.4375rem 0.875rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, border-color 0.12s, color 0.12s, opacity 0.12s;
+  border: 1px solid transparent;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btnSecondary {
+  composes: btn;
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+.btnSecondary:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  color: var(--color-text-primary);
+  border-color: #c9cdd6;
+}
+
+.btnPrimary {
+  composes: btn;
+  background: var(--color-accent);
+  color: #fff;
+}
+
+.btnPrimary:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.btnDanger {
+  composes: btn;
+  background: var(--color-surface-error);
+  border-color: var(--color-border-error);
+  color: var(--color-text-error);
+}
+
+.btnDanger:hover:not(:disabled) {
+  background: var(--color-border-error);
+}
+
+.btnIcon {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.btnIconSpin {
+  font-size: 1rem;
+  line-height: 1;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ---------------------------------------------------------------------------
+   Key table
+   --------------------------------------------------------------------------- */
+.tableWrap {
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.table thead {
+  background: var(--color-surface-subtle);
+}
+
+.table th {
+  padding: 0.625rem 0.875rem;
+  text-align: left;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.table td {
+  padding: 0.625rem 0.875rem;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: middle;
+  max-width: 0; /* needed for text-overflow in td */
+}
+
+.table tr:last-child td {
+  border-bottom: none;
+}
+
+.table tbody tr {
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.table tbody tr:hover {
+  background: var(--color-surface-subtle);
+}
+
+/* Column widths */
+.colKey {
+  width: 28%;
+}
+
+.colValue {
+  width: 38%;
+}
+
+.colTtl {
+  width: 14%;
+}
+
+.colActions {
+  width: 20%;
+}
+
+/* Cell content */
+.cellKey {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--color-accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cellValue {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cellTtl {
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.ttlPermanent {
+  color: var(--color-text-muted);
+}
+
+.ttlExpiring {
+  color: var(--color-status-loading);
+  font-weight: 500;
+}
+
+.ttlNormal {
+  color: var(--color-text-ok);
+}
+
+/* Actions cell */
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.actionBtn {
+  padding: 0.3125rem 0.5625rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  white-space: nowrap;
+}
+
+.actionBtnEdit {
+  composes: actionBtn;
+  background: var(--color-accent-subtle);
+  color: var(--color-accent);
+  border-color: transparent;
+}
+
+.actionBtnEdit:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
+}
+
+.actionBtnDelete {
+  composes: actionBtn;
+  background: transparent;
+  color: var(--color-text-muted);
+  border-color: transparent;
+}
+
+.actionBtnDelete:hover {
+  background: var(--color-surface-error);
+  color: var(--color-text-error);
+  border-color: var(--color-border-error);
+}
+
+/* ---------------------------------------------------------------------------
+   Pagination
+   --------------------------------------------------------------------------- */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+.paginationInfo {
+  font-size: 0.8125rem;
+  color: var(--color-text-muted);
+}
+
+.paginationControls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.pageLabel {
+  font-size: 0.875rem;
+  color: var(--color-text-secondary);
+  min-width: 4rem;
+  text-align: center;
+}
+
+/* ---------------------------------------------------------------------------
+   Table loading overlay
+   --------------------------------------------------------------------------- */
+.tableContainer {
+  position: relative;
+}
+
+.tableOverlay {
+  position: absolute;
+  inset: 0;
+  background: rgb(255 255 255 / 0.6);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+/* ---------------------------------------------------------------------------
+   Header row (title + actions)
+   --------------------------------------------------------------------------- */
+.headerRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex-shrink: 0;
+  padding-top: 0.25rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Form fields (create / edit modal)
+   --------------------------------------------------------------------------- */
+.formGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  margin-bottom: 1rem;
+}
+
+.formGroup:last-of-type {
+  margin-bottom: 0;
+}
+
+.label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.required {
+  color: var(--color-status-error);
+  margin-left: 0.125rem;
+}
+
+.input,
+.textarea,
+.select {
+  padding: 0.4375rem 0.75rem;
+  font-size: 0.875rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  transition: border-color 0.12s, box-shadow 0.12s;
+  width: 100%;
+}
+
+.input[readonly],
+.textarea[readonly] {
+  background: var(--color-surface-subtle);
+  color: var(--color-text-secondary);
+  cursor: default;
+}
+
+.input:focus,
+.textarea:focus,
+.select:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgb(37 99 235 / 0.12);
+}
+
+.input.inputMono,
+.textarea.textareaMono {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+}
+
+.textarea {
+  min-height: 7rem;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.fieldHint {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.fieldError {
+  font-size: 0.75rem;
+  color: var(--color-text-error);
+}
+
+/* TTL input row */
+.ttlRow {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ttlRow .select {
+  width: auto;
+  flex-shrink: 0;
+}
+
+.ttlRow .input {
+  flex: 1;
+}
+
+/* Modal footer with action buttons */
+.modalFooter {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.625rem;
+  padding-top: 1.25rem;
+  margin-top: 1rem;
+  border-top: 1px solid var(--color-border);
+}
+
+/* ---------------------------------------------------------------------------
+   View modal
+   --------------------------------------------------------------------------- */
+.viewRow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 1.25rem;
+}
+
+.viewRow:last-child {
+  margin-bottom: 0;
+}
+
+.viewLabel {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.viewValue {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  color: var(--color-text-primary);
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 0.5rem 0.75rem;
+  word-break: break-all;
+  white-space: pre-wrap;
+  max-height: 14rem;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+
+.viewValueInline {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  color: var(--color-text-secondary);
+}
+
+/* ---------------------------------------------------------------------------
+   Confirm dialog
+   --------------------------------------------------------------------------- */
+.confirmBody {
+  text-align: center;
+  padding: 0.5rem 0 0.25rem;
+}
+
+.confirmIcon {
+  font-size: 2rem;
+  margin-bottom: 0.75rem;
+  display: block;
+}
+
+.confirmTitle {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  margin-bottom: 0.375rem;
+}
+
+.confirmSub {
+  font-size: 0.875rem;
+  color: var(--color-text-secondary);
+  margin-bottom: 1.5rem;
+}
+
+.confirmKey {
+  font-family: var(--font-mono);
+  color: var(--color-text-primary);
+}
+
+.confirmActions {
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Responsive
+   --------------------------------------------------------------------------- */
+@media (max-width: 640px) {
+  .toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .headerRow {
+    flex-direction: column;
+  }
+
+  .headerActions {
+    padding-top: 0;
+  }
+
+  /* On narrow screens hide the Value column header/cells */
+  .colValue,
+  .colTtl {
+    display: none;
+  }
+
+  .pagination {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
