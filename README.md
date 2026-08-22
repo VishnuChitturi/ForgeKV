@@ -2,7 +2,7 @@
 
 A persistent, concurrent key-value storage engine built from scratch in C++20.
 
-> **Status:** Stage 12 — Benchmarking. KV engine, HTTP server, WAL, snapshots, compaction, TTL, statistics, and benchmark suite all implemented.
+> **Status:** Stage 13 — Final Hardening. KV engine, HTTP server, WAL, snapshots, compaction, TTL, statistics, benchmark suite, and comprehensive test suite all implemented.
 > See the [Development Roadmap](#development-roadmap) for the full history.
 
 ---
@@ -135,20 +135,20 @@ Each component is introduced at the appropriate stage. The architecture is desig
 
 | Stage | Title                   | Status      | Description                                              |
 |-------|-------------------------|-------------|----------------------------------------------------------|
-| 0     | Project Foundation      | ✅ Current  | Repo structure, build system, documentation              |
-| 1     | In-Memory Store         | 🔲 Planned  | `KeyValueStore` backed by `unordered_map`                |
-| 2     | Storage Abstraction     | 🔲 Planned  | Decouple engine from concrete map implementation         |
-| 3     | Write-Ahead Log (text)  | 🔲 Planned  | Append-only log for mutations                            |
-| 4     | Binary WAL              | 🔲 Planned  | Structured binary record format with checksums           |
-| 5     | Crash Recovery          | 🔲 Planned  | Replay WAL on startup to reconstruct state               |
-| 6     | HTTP Server             | 🔲 Planned  | REST API over HTTP                                       |
-| 7     | Concurrency             | 🔲 Planned  | Thread-safe access with `std::shared_mutex`              |
-| 8     | Log Compaction          | 🔲 Planned  | Reclaim WAL space by removing obsolete entries           |
-| 9     | Snapshots               | 🔲 Planned  | Periodic full-state checkpoints                          |
-| 10    | TTL / Expiration        | 🔲 Planned  | Key expiry with background cleanup                       |
-| 11    | Statistics              | 🔲 Planned  | Operational metrics and observability                    |
+| 0     | Project Foundation      | ✅ Complete | Repo structure, build system, documentation              |
+| 1     | In-Memory Store         | ✅ Complete | `KeyValueStore` backed by `unordered_map`                |
+| 2     | Storage Abstraction     | ✅ Complete | Decouple engine from concrete map implementation         |
+| 3     | Write-Ahead Log (text)  | ✅ Complete | Append-only log for mutations                            |
+| 4     | Binary WAL              | ✅ Complete | Structured binary record format with checksums           |
+| 5     | Crash Recovery          | ✅ Complete | Replay WAL on startup to reconstruct state               |
+| 6     | HTTP Server             | ✅ Complete | REST API over HTTP                                       |
+| 7     | Concurrency             | ✅ Complete | Thread-safe access with `std::shared_mutex`              |
+| 8     | Log Compaction          | ✅ Complete | Reclaim WAL space by removing obsolete entries           |
+| 9     | Snapshots               | ✅ Complete | Periodic full-state checkpoints                          |
+| 10    | TTL / Expiration        | ✅ Complete | Key expiry with background cleanup                       |
+| 11    | Statistics              | ✅ Complete | Operational metrics and observability                    |
 | 12    | Benchmarking            | ✅ Complete | Throughput, latency, and resource benchmarks             |
-| 13    | Testing                 | 🔲 Planned  | Unit, integration, persistence, concurrency, stress tests|
+| 13    | Final Hardening         | ✅ Complete | 157 new tests: WAL/recovery/snapshot/TTL/concurrency hardening |
 
 See the `docs/` directory for detailed design notes on each stage.
 
@@ -209,8 +209,8 @@ ForgeKV/
 |---------------|----------------------------|-----------------------------------------------------|
 | Language      | C++20                      | Systems-level control, modern standard library      |
 | Build system  | CMake 3.20+                | Cross-platform, industry standard                   |
-| Testing       | To be selected at Stage 13 | Will evaluate GoogleTest or Catch2                  |
-| HTTP server   | To be selected at Stage 6  | Will evaluate cpp-httplib or minimal from-scratch   |
+| Testing       | Custom harness (no deps)   | Self-contained; 412 tests across 12 CTest targets   |
+| HTTP server   | cpp-httplib (vendored)     | Single-header, MIT license, no external deps        |
 | Dependencies  | Minimal by design          | Each addition must justify its presence             |
 
 External libraries are introduced only when they provide clear value over a from-scratch implementation.
@@ -234,20 +234,34 @@ At Stage 0 there are no build targets. CMake configuration should succeed and pr
 
 ## Testing Strategy
 
-> **Status: Planned (Stage 13)**
+> **Status: Implemented (Stage 13)**
 
-ForgeKV will include a comprehensive test suite covering:
+ForgeKV includes a comprehensive test suite of **412 tests** across 12 CTest targets covering:
 
 - **Unit tests** — individual components in isolation (store, WAL, recovery, TTL)
 - **Integration tests** — components working together end-to-end
 - **Persistence tests** — data survives process restart
-- **WAL tests** — correct record format, ordering, and flushing
+- **WAL tests** — correct record format, ordering, flushing, and corruption detection
 - **Corruption tests** — partial records and checksum failures handled gracefully
 - **Crash recovery tests** — state correctly reconstructed after simulated crash
-- **Concurrency tests** — no data races under multi-threaded access
+- **Concurrency tests** — no data races under multi-threaded access using `std::latch` and `std::barrier`
 - **Stress tests** — behavior under sustained high load
+- **Snapshot tests** — corruption fallback, TTL preservation, boundary correctness
+- **Compaction tests** — state invariants before and after, interaction with snapshots and TTL
+- **TTL tests** — boundary conditions, persistence, expiry across restart
+- **HTTP edge-case tests** — status codes, special characters, concurrent requests
+- **Boundary/input tests** — empty keys, large values, binary-safe strings, Unicode
+- **Lifecycle tests** — resource cleanup, temp file removal, server start/stop
+- **Randomized tests** — fixed-seed state-machine comparison against a reference model
 
-The test suite will be introduced progressively, with tests added as each stage is implemented.
+Run with:
+
+```bash
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+See `docs/13-final-hardening.md` for the full hardening strategy, failure scenarios tested, sanitizer commands, and known limitations.
 
 ---
 
