@@ -1,0 +1,120 @@
+/* =============================================================================
+   HttpPerformancePanel — Stage 18
+   ============================================================================= */
+
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 1.125rem 1.25rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.badge {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+.empty {
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+/* ---- Table ---- */
+.tableWrapper {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin-bottom: 0.75rem;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.table th,
+.table td {
+  padding: 0.4375rem 0.625rem;
+}
+
+.table thead tr {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.table tbody tr {
+  border-bottom: 1px solid var(--color-surface-subtle);
+}
+
+.table tbody tr:last-child {
+  border-bottom: none;
+}
+
+.table tbody tr:hover {
+  background: var(--color-surface-subtle);
+}
+
+.thLabel,
+.thNum {
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.thLabel { text-align: left; }
+.thNum   { text-align: right; }
+
+.tdLabel {
+  text-align: left;
+  color: var(--color-text-primary);
+  font-weight: 500;
+  min-width: 6rem;
+}
+
+.tdNum {
+  text-align: right;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Missing row */
+.rowMissing td {
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+.tdMissing {
+  text-align: left;
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+/* ---- Note ---- */
+.note {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  line-height: 1.5;
+  margin: 0;
+}

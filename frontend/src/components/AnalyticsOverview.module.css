@@ -1,0 +1,17 @@
+/* =============================================================================
+   AnalyticsOverview — Stage 18
+   ============================================================================= */
+
+.grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.875rem;
+  align-items: stretch;
+}
+
+/* On narrower viewports, stack vertically */
+@media (max-width: 720px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}

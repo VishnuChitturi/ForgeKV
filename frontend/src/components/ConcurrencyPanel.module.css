@@ -1,0 +1,144 @@
+/* =============================================================================
+   ConcurrencyPanel — Stage 18
+   ============================================================================= */
+
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 1.125rem 1.25rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.badge {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+.empty {
+  font-size: 0.875rem;
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+/* ---- Groups (GET, SET, Mixed) ---- */
+.groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: 1rem;
+}
+
+.group {
+  /* no border — they sit inside the outer panel */
+}
+
+.groupTitle {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin: 0 0 0.5rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ---- Table ---- */
+.tableWrapper {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.table thead tr {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.table tbody tr {
+  border-bottom: 1px solid var(--color-surface-subtle);
+}
+
+.table tbody tr:last-child {
+  border-bottom: none;
+}
+
+.thThreads,
+.thBar,
+.thNum {
+  padding: 0.3rem 0.375rem;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.thThreads { text-align: center; width: 4rem; }
+.thBar     { text-align: left; }
+.thNum     { text-align: right; width: 5rem; }
+
+.tdThreads {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  padding: 0.3rem 0.375rem;
+}
+
+.tdBar {
+  padding: 0.3rem 0.375rem;
+  min-width: 80px;
+}
+
+.tdNum {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  padding: 0.3rem 0.375rem;
+}
+
+/* ---- Bar inside table cell ---- */
+.barTrack {
+  height: 0.4375rem;
+  background: var(--color-surface-subtle);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+
+.bar {
+  height: 100%;
+  background: var(--color-accent);
+  border-radius: 9999px;
+  transition: width 0.4s ease;
+  min-width: 2px;
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 640px) {
+  .groups {
+    grid-template-columns: 1fr;
+  }
+}

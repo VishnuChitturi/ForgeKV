@@ -32,9 +32,12 @@
 #include "forgekv/wal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -58,6 +61,7 @@ struct BenchConfig {
     bool          latency     = true;      // collect latency samples
     std::uint64_t latency_samples = 10'000; // max latency samples to collect
     std::string   output_file;             // empty = no CSV output
+    std::string   json_output_file;        // empty = no JSON output; "-" = stdout
     bool          run_http    = true;      // run HTTP benchmark
     bool          run_large   = false;     // run large dataset (1M ops)
 };
@@ -348,6 +352,193 @@ inline void write_csv(const std::string& path,
 }
 
 // =============================================================================
+// JSON output (Stage 18 — machine-readable benchmark artifact for the frontend)
+//
+// Schema version: 1
+//
+// Outputs a self-describing JSON document to the given path (or stdout if
+// path is empty).  The frontend reads this file from the public/ directory.
+//
+// Format:
+//   {
+//     "schema_version": 1,
+//     "forgekv_version": "0.13.0",
+//     "generated_at": "<ISO-8601 UTC timestamp>",
+//     "environment": {
+//       "os": "macOS" | "Linux" | "Windows" | "Unknown",
+//       "compiler": "<compiler string>",
+//       "cpp_standard": "C++20",
+//       "hw_threads": <N>
+//     },
+//     "config": {
+//       "operations": <N>,
+//       "warmup": <N>,
+//       "value_size_bytes": <N>,
+//       "max_threads": <N>,
+//       "latency_enabled": true | false,
+//       "http_enabled": true | false
+//     },
+//     "workloads": [
+//       {
+//         "name": "<workload name>",
+//         "threads": <N>,
+//         "ops": <N>,
+//         "elapsed_s": <double>,
+//         "ops_per_sec": <double>,
+//         "latency_us": {
+//           "avg": <double>,  -- 0 if not measured
+//           "p50": <double>,
+//           "p95": <double>,
+//           "p99": <double>
+//         },
+//         "wal_before_bytes": <N>,
+//         "wal_after_bytes": <N>
+//       },
+//       ...
+//     ]
+//   }
+//
+// Units:
+//   - ops_per_sec: operations per second (throughput)
+//   - elapsed_s:   seconds (double)
+//   - latency_us:  microseconds (double) — 0 means "not measured"
+//   - wal_*_bytes: bytes (uint64)
+//
+// NOTE: latency numbers come from per-operation timing with individual Timer
+// calls; this includes timer overhead (~nanoseconds per sample on modern
+// hardware). The numbers are benchmark measurements, not live server metrics.
+// =============================================================================
+
+// Minimal JSON string escape: handles \, ", \n, \r, \t, and control chars.
+inline std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (const unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    // Control character: encode as \uXXXX.
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+// Return current UTC time as an ISO-8601 string (seconds precision).
+inline std::string iso8601_now() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    struct tm tm_buf{};
+#if defined(_WIN32)
+    gmtime_s(&tm_buf, &t);
+#else
+    gmtime_r(&t, &tm_buf);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+    return buf;
+}
+
+inline void write_json(const std::string& path,
+                       const std::vector<BenchResult>& results,
+                       const BenchConfig& cfg) {
+    std::ostringstream j;
+
+    // Helper lambdas for indented emission.
+    auto dbl = [&](double v, int prec = 2) -> std::string {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(prec) << v;
+        return ss.str();
+    };
+
+    j << "{\n";
+    j << "  \"schema_version\": 1,\n";
+    j << "  \"forgekv_version\": \"0.13.0\",\n";
+    j << "  \"generated_at\": \"" << iso8601_now() << "\",\n";
+
+    // Environment
+    j << "  \"environment\": {\n";
+#if defined(__APPLE__)
+    j << "    \"os\": \"macOS\",\n";
+#elif defined(__linux__)
+    j << "    \"os\": \"Linux\",\n";
+#elif defined(_WIN32)
+    j << "    \"os\": \"Windows\",\n";
+#else
+    j << "    \"os\": \"Unknown\",\n";
+#endif
+#if defined(__clang__)
+    j << "    \"compiler\": \"Clang " << __clang_major__ << "." << __clang_minor__ << "\",\n";
+#elif defined(__GNUC__)
+    j << "    \"compiler\": \"GCC " << __GNUC__ << "." << __GNUC_MINOR__ << "\",\n";
+#else
+    j << "    \"compiler\": \"Unknown\",\n";
+#endif
+    j << "    \"cpp_standard\": \"C++20\",\n";
+    j << "    \"hw_threads\": " << std::thread::hardware_concurrency() << "\n";
+    j << "  },\n";
+
+    // Config
+    j << "  \"config\": {\n";
+    j << "    \"operations\": "        << cfg.operations  << ",\n";
+    j << "    \"warmup\": "            << cfg.warmup      << ",\n";
+    j << "    \"value_size_bytes\": "  << cfg.value_size  << ",\n";
+    j << "    \"max_threads\": "       << cfg.threads     << ",\n";
+    j << "    \"latency_enabled\": "   << (cfg.latency   ? "true" : "false") << ",\n";
+    j << "    \"http_enabled\": "      << (cfg.run_http  ? "true" : "false")  << "\n";
+    j << "  },\n";
+
+    // Workloads array
+    j << "  \"workloads\": [\n";
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        const auto& r = results[i];
+        const bool last = (i + 1 == results.size());
+        j << "    {\n";
+        j << "      \"name\": \""        << json_escape(r.workload) << "\",\n";
+        j << "      \"threads\": "       << r.threads << ",\n";
+        j << "      \"ops\": "           << r.ops << ",\n";
+        j << "      \"elapsed_s\": "     << dbl(r.elapsed_s, 6) << ",\n";
+        j << "      \"ops_per_sec\": "   << dbl(r.ops_per_sec, 2) << ",\n";
+        j << "      \"latency_us\": {\n";
+        j << "        \"avg\": " << dbl(r.lat_avg_us, 2) << ",\n";
+        j << "        \"p50\": " << dbl(r.lat_p50_us, 2) << ",\n";
+        j << "        \"p95\": " << dbl(r.lat_p95_us, 2) << ",\n";
+        j << "        \"p99\": " << dbl(r.lat_p99_us, 2) << "\n";
+        j << "      },\n";
+        j << "      \"wal_before_bytes\": " << r.wal_before << ",\n";
+        j << "      \"wal_after_bytes\": "  << r.wal_after  << "\n";
+        j << "    }" << (last ? "" : ",") << "\n";
+    }
+    j << "  ]\n";
+    j << "}\n";
+
+    const std::string content = j.str();
+
+    if (path.empty()) {
+        // Write to stdout (useful for piping: ./forgekv_benchmark --format json > results.json)
+        std::cout << content;
+    } else {
+        std::ofstream f(path);
+        if (!f.is_open()) {
+            std::cerr << "Warning: cannot open JSON output file: " << path << '\n';
+            return;
+        }
+        f << content;
+        std::cout << "\nJSON results written to: " << path << '\n';
+    }
+}
+
+// =============================================================================
 // CLI argument parsing
 // =============================================================================
 
@@ -365,6 +556,18 @@ inline BenchConfig parse_args(int argc, char* argv[]) {
             cfg.threads = static_cast<std::uint32_t>(std::stoul(argv[++i]));
         } else if ((arg == "--output" || arg == "-o") && i + 1 < argc) {
             cfg.output_file = argv[++i];
+        } else if (arg == "--json-output" && i + 1 < argc) {
+            // --json-output <file>  — write JSON results to file
+            cfg.json_output_file = argv[++i];
+        } else if (arg == "--format" && i + 1 < argc) {
+            // --format json  — write JSON results to stdout ("-")
+            std::string fmt = argv[++i];
+            if (fmt == "json") {
+                cfg.json_output_file = "-";  // "-" = stdout
+            } else if (fmt != "csv") {
+                std::cerr << "Unknown format: " << fmt
+                          << " (supported: csv, json)\n";
+            }
         } else if (arg == "--no-latency") {
             cfg.latency = false;
         } else if (arg == "--no-http") {
@@ -378,20 +581,24 @@ R"(ForgeKV Benchmark — Stage 12
 Usage: forgekv_benchmark [options]
 
 Options:
-  --operations, -n <N>    Number of operations per workload (default: 100000)
-  --warmup,     -w <N>    Warmup operations (not measured)   (default: 1000)
-  --value-size, -v <N>    Value payload size in bytes        (default: 128)
-  --threads,    -t <N>    Max threads for concurrency bench  (default: 4)
-  --output,     -o <file> Write results to CSV file
-  --no-latency            Skip latency sampling
-  --no-http               Skip HTTP benchmark
-  --large                 Also run 1,000,000-operation suite
-  --help,       -h        Show this help
+  --operations, -n <N>      Number of operations per workload (default: 100000)
+  --warmup,     -w <N>      Warmup operations (not measured)   (default: 1000)
+  --value-size, -v <N>      Value payload size in bytes        (default: 128)
+  --threads,    -t <N>      Max threads for concurrency bench  (default: 4)
+  --output,     -o <file>   Write results to CSV file
+  --json-output    <file>   Write results to JSON file
+  --format         json     Write JSON results to stdout
+  --no-latency              Skip latency sampling
+  --no-http                 Skip HTTP benchmark
+  --large                   Also run 1,000,000-operation suite
+  --help,       -h          Show this help
 
 Examples:
   ./forgekv_benchmark
   ./forgekv_benchmark --operations 50000 --threads 8
   ./forgekv_benchmark --output results.csv
+  ./forgekv_benchmark --json-output benchmark-results.json
+  ./forgekv_benchmark --format json > benchmark-results.json
   ./forgekv_benchmark --value-size 1024 --no-http
 )";
             std::exit(0);

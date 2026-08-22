@@ -2,7 +2,7 @@
 
 A persistent, concurrent key-value storage engine built from scratch in C++20.
 
-> **Status:** Stage 17 — Admin Dashboard. Operational control/monitoring page: server health, operation statistics, persistence info, maintenance controls (POST /snapshot, POST /compact), system information, manual refresh, toast notifications.
+> **Status:** Stage 18 — Analytics + Performance. Live analytics dashboard: GET hit rate, operation breakdown, persistence analytics; benchmark performance visualization: throughput, latency percentiles, concurrency scaling, HTTP performance, snapshot/compaction timing.
 > See the [Development Roadmap](#development-roadmap) for the full history.
 
 ---
@@ -154,6 +154,7 @@ Each component is introduced at the appropriate stage. The architecture is desig
 | 15    | Dashboard               | ✅ Complete | Real /health + /stats dashboard: overview, cards, stats, formatting |
 | 16    | Key Management          | ✅ Complete | GET /keys API, prefix filter, pagination, full CRUD UI, TTL, toasts |
 | 17    | Admin Dashboard         | ✅ Complete | Operational dashboard: health, stats, persistence, POST /snapshot + /compact, system info |
+| 18    | Analytics + Performance | ✅ Complete | Live analytics: GET hit rate, op breakdown, persistence; benchmark: throughput, latency, concurrency, HTTP, snapshot/compaction |
 
 See the `docs/` directory for detailed design notes on each stage.
 

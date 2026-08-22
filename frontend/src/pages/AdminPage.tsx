@@ -1,37 +1,34 @@
 // =============================================================================
-// AdminPage — ForgeKV Admin Dashboard (Stage 17)
+// AdminPage — ForgeKV Admin Dashboard (Stage 18: Analytics + Performance)
 //
-// Operational control and monitoring page for the ForgeKV engine.
+// Extends the Stage 17 operator dashboard with analytics and performance
+// visualization sections.
 //
-// Answers the questions an operator would ask:
-//   "Is the server healthy?"
-//   "What is its current state?"
-//   "How is persistence doing?"
-//   "What operational actions are available?"
+// SECTION LAYOUT:
+//   1. Page header           — title, description, refresh button, last-updated
+//   2. Server Health         — status + key operational metrics        [LIVE]
+//   3. Analytics Overview    — GET hit rate donut + operation breakdown [LIVE]
+//   4. Persistence Analytics — WAL, live keys, snapshot, TTL/expiry    [LIVE]
+//   5. Storage & Persistence — OperationStats + PersistencePanel       [LIVE]
+//   6. Maintenance           — Snapshot + Compact controls             [live action]
+//   7. Benchmark Performance — throughput, latency, concurrency,
+//                              HTTP, snapshot/compaction               [BENCHMARK ARTIFACT]
+//   8. System Information    — project version, HTTP lib, model        [STATIC]
 //
-// Layout:
-//   1. Page header  — title, description, last-updated, refresh button
-//   2. AdminHealth  — server status + key operational metrics
-//   3. Detail row   — OperationStats + PersistencePanel side by side
-//   4. Maintenance  — Create Snapshot + Compact WAL controls
-//   5. SystemInfo   — project version, HTTP library, concurrency model
+// DATA SOURCES:
+//   LIVE  — GET /health + GET /stats, refreshed manually.
+//   BENCH — /benchmark-results.json served from frontend/public/.
+//            Loaded once on mount. NOT re-run on refresh.
+//            Produced by: ./build/forgekv_benchmark --json-output
+//                         frontend/public/benchmark-results.json
 //
-// Refresh:
-//   Manual-only. GET /health + GET /stats run in parallel.
-//   Last-updated timestamp is a frontend timestamp (Date.now()).
-//   No automatic polling. No websockets.
-//
-// Error handling:
-//   - First load: shows Loading spinner, then ErrorMessage on failure.
-//   - Subsequent refreshes: shows subtle opacity change while loading;
-//     keeps last known data visible on error via toast.
-//   - Backend offline is surfaced in AdminHealth (status: Offline) and
-//     handled gracefully — the page does not crash.
-//   - Snapshot/compact failures surface as error toasts; the page stays
-//     functional.
+// These two data sources are ALWAYS clearly separated in the UI.
+// Benchmark results are NEVER labeled as live metrics.
 // =============================================================================
 
 import { useCallback, useEffect, useRef, useState } from "react";
+
+// Stage 17 components (preserved)
 import { AdminHealth } from "../components/AdminHealth";
 import { ErrorMessage } from "../components/ErrorMessage";
 import { Loading } from "../components/Loading";
@@ -40,9 +37,24 @@ import { OperationStats } from "../components/OperationStats";
 import { PersistencePanel } from "../components/PersistencePanel";
 import { SystemInfo } from "../components/SystemInfo";
 import { Toast, useToast } from "../components/Toast";
+
+// Stage 18 — Live analytics components
+import { AnalyticsOverview } from "../components/AnalyticsOverview";
+import { PersistenceAnalytics } from "../components/PersistenceAnalytics";
+
+// Stage 18 — Benchmark components
+import { BenchmarkNotice } from "../components/BenchmarkNotice";
+import { BenchmarkOverview } from "../components/BenchmarkOverview";
+import { ConcurrencyPanel } from "../components/ConcurrencyPanel";
+import { HttpPerformancePanel } from "../components/HttpPerformancePanel";
+import { LatencyPanel } from "../components/LatencyPanel";
+import { SnapshotCompactionPanel } from "../components/SnapshotCompactionPanel";
+
 import type { ServerStatus } from "../hooks/useServerStatus";
 import { getHealth, getStats } from "../services/api";
 import type { StatsResponse } from "../types/api";
+import type { BenchLoadState } from "../types/benchmark";
+import { loadBenchmarkResults } from "../utils/benchmark";
 import { formatLastUpdated } from "../utils/format";
 import styles from "./AdminPage.module.css";
 import pageStyles from "./Page.module.css";
@@ -60,13 +72,30 @@ export function AdminPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number | null>(null);
 
+  // Benchmark data is loaded once on mount. It is NOT re-fetched on refresh.
+  const [benchState, setBenchState] = useState<BenchLoadState>({ status: "idle" });
+
   // Controls whether we show a full loading overlay vs subtle refresh state.
   const hasLoadedRef = useRef(false);
 
   const { toasts, addToast, dismissToast } = useToast();
 
   // -------------------------------------------------------------------------
-  // Fetch /health + /stats in parallel
+  // Load benchmark artifact once on mount
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    setBenchState({ status: "loading" });
+    loadBenchmarkResults().then((result) => {
+      if (result.ok) {
+        setBenchState({ status: "ready", data: result.data });
+      } else {
+        setBenchState({ status: "unavailable", reason: result.reason });
+      }
+    });
+  }, []); // empty deps — only runs once; benchmarks are not re-run on refresh
+
+  // -------------------------------------------------------------------------
+  // Fetch /health + /stats in parallel (live data only)
   // -------------------------------------------------------------------------
   const fetchData = useCallback(async () => {
     if (hasLoadedRef.current) {
@@ -84,7 +113,6 @@ export function AdminPage() {
 
     if (!statsResult.ok) {
       if (hasLoadedRef.current) {
-        // Keep the current data visible; notify via toast.
         addToast(
           `Refresh failed: ${statsResult.error || "Unable to reach server."}`,
           "error"
@@ -117,15 +145,15 @@ export function AdminPage() {
       <header className={pageStyles.pageHeader}>
         <div className={styles.headerRow}>
           <div>
-            <h1 className={pageStyles.pageTitle}>Admin Dashboard</h1>
+            <h1 className={pageStyles.pageTitle}>Analytics &amp; Performance</h1>
             <p className={pageStyles.pageDescription}>
-              Operational control and monitoring for the ForgeKV engine.
+              Live server metrics and benchmark performance for the ForgeKV engine.
             </p>
           </div>
           <div className={styles.headerActions}>
             {lastUpdated !== null && (
               <span className={styles.lastUpdated} aria-live="polite">
-                Updated: {formatLastUpdated(lastUpdated)}
+                Live data: {formatLastUpdated(lastUpdated)}
               </span>
             )}
             <button
@@ -133,7 +161,7 @@ export function AdminPage() {
               type="button"
               onClick={fetchData}
               disabled={refreshing || state.phase === "loading"}
-              aria-label="Refresh admin dashboard"
+              aria-label="Refresh live server metrics"
             >
               <span
                 className={refreshing ? styles.refreshIconSpin : styles.refreshIcon}
@@ -141,7 +169,7 @@ export function AdminPage() {
               >
                 ↻
               </span>
-              {refreshing ? "Refreshing…" : "Refresh"}
+              {refreshing ? "Refreshing…" : "Refresh Live"}
             </button>
           </div>
         </div>
@@ -172,7 +200,9 @@ export function AdminPage() {
           <div
             className={`${styles.content} ${refreshing ? styles.contentRefreshing : ""}`}
           >
-            {/* ── Section: Server Health ── */}
+            {/* ── LIVE DATA SECTIONS ── */}
+
+            {/* Section: Server Health */}
             <section aria-labelledby="section-health">
               <h2 id="section-health" className={styles.sectionTitle}>
                 Server Health
@@ -183,7 +213,26 @@ export function AdminPage() {
               />
             </section>
 
-            {/* ── Section: Storage & Persistence ── */}
+            {/* Section: Live Operation Analytics */}
+            <section aria-labelledby="section-analytics">
+              <h2 id="section-analytics" className={styles.sectionTitle}>
+                Live Operation Analytics
+              </h2>
+              <p className={styles.sectionDesc}>
+                Cumulative counters since server start — refreshed manually.
+              </p>
+              <AnalyticsOverview stats={state.stats} />
+            </section>
+
+            {/* Section: Persistence Analytics */}
+            <section aria-labelledby="section-persist-analytics">
+              <h2 id="section-persist-analytics" className={styles.sectionTitle}>
+                Persistence Analytics
+              </h2>
+              <PersistenceAnalytics stats={state.stats} />
+            </section>
+
+            {/* Section: Storage & Persistence (Stage 17 detail panels) */}
             <section aria-labelledby="section-storage">
               <h2 id="section-storage" className={styles.sectionTitle}>
                 Storage &amp; Persistence
@@ -194,7 +243,7 @@ export function AdminPage() {
               </div>
             </section>
 
-            {/* ── Section: Maintenance ── */}
+            {/* Section: Maintenance */}
             <section aria-labelledby="section-maintenance">
               <h2 id="section-maintenance" className={styles.sectionTitle}>
                 Maintenance
@@ -205,7 +254,42 @@ export function AdminPage() {
               />
             </section>
 
-            {/* ── Section: System Information ── */}
+            {/* ── BENCHMARK DATA SECTIONS ── */}
+
+            {/* Section: Benchmark Performance */}
+            <section aria-labelledby="section-benchmark">
+              <h2 id="section-benchmark" className={styles.sectionTitle}>
+                Benchmark Performance
+              </h2>
+
+              {/* Always show the notice — distinguishes live vs benchmark */}
+              {benchState.status === "ready" ? (
+                <>
+                  <BenchmarkNotice
+                    generatedAt={benchState.data.generated_at}
+                    forgekvVersion={benchState.data.forgekv_version}
+                  />
+                  <div className={styles.benchGrid}>
+                    <BenchmarkOverview data={benchState.data} />
+                    <LatencyPanel data={benchState.data} />
+                    <ConcurrencyPanel data={benchState.data} />
+                    <HttpPerformancePanel data={benchState.data} />
+                    <SnapshotCompactionPanel data={benchState.data} />
+                  </div>
+                </>
+              ) : benchState.status === "unavailable" ? (
+                <BenchmarkNotice
+                  unavailable
+                  reason={benchState.reason}
+                />
+              ) : (
+                <div className={styles.benchLoading}>
+                  <Loading label="Loading benchmark results…" size="sm" />
+                </div>
+              )}
+            </section>
+
+            {/* Section: System Information */}
             <section aria-labelledby="section-sysinfo">
               <h2 id="section-sysinfo" className={styles.sectionTitle}>
                 System Information

@@ -1,0 +1,441 @@
+{
+  "schema_version": 1,
+  "forgekv_version": "0.13.0",
+  "generated_at": "2026-08-22T16:17:38Z",
+  "environment": {
+    "os": "macOS",
+    "compiler": "Clang 17.0",
+    "cpp_standard": "C++20",
+    "hw_threads": 8
+  },
+  "config": {
+    "operations": 10000,
+    "warmup": 100,
+    "value_size_bytes": 128,
+    "max_threads": 4,
+    "latency_enabled": true,
+    "http_enabled": true
+  },
+  "workloads": [
+    {
+      "name": "Sequential SET",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.071834,
+      "ops_per_sec": 139209.12,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Sequential GET (hit)",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.004002,
+      "ops_per_sec": 2498828.67,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Sequential GET (miss)",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.002289,
+      "ops_per_sec": 4368401.26,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "Sequential DELETE",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.036899,
+      "ops_per_sec": 271012.20,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 1920000
+    },
+    {
+      "name": "Mixed (50G/30S/10D/10M)",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.025726,
+      "ops_per_sec": 388710.55,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 800000,
+      "wal_after_bytes": 1296000
+    },
+    {
+      "name": "TTL SET (set_with_ttl)",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.073946,
+      "ops_per_sec": 135233.21,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 1680000
+    },
+    {
+      "name": "Snapshot",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.045572,
+      "ops_per_sec": 0.00,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Compaction",
+      "threads": 1,
+      "ops": 1000,
+      "elapsed_s": 0.008581,
+      "ops_per_sec": 0.00,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 800000,
+      "wal_after_bytes": 160000
+    },
+    {
+      "name": "Concurrent GET",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.004019,
+      "ops_per_sec": 2488490.73,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Concurrent GET",
+      "threads": 2,
+      "ops": 10000,
+      "elapsed_s": 0.002853,
+      "ops_per_sec": 3505030.77,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Concurrent GET",
+      "threads": 4,
+      "ops": 10000,
+      "elapsed_s": 0.003421,
+      "ops_per_sec": 2923406.46,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Concurrent SET",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.072017,
+      "ops_per_sec": 138855.62,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Concurrent SET",
+      "threads": 2,
+      "ops": 10000,
+      "elapsed_s": 0.076530,
+      "ops_per_sec": 130668.21,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Concurrent SET",
+      "threads": 4,
+      "ops": 10000,
+      "elapsed_s": 0.088683,
+      "ops_per_sec": 112761.61,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 1600000
+    },
+    {
+      "name": "Concurrent Mixed",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.038038,
+      "ops_per_sec": 262896.73,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 2400000
+    },
+    {
+      "name": "Concurrent Mixed",
+      "threads": 2,
+      "ops": 10000,
+      "elapsed_s": 0.040926,
+      "ops_per_sec": 244345.19,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 2400000
+    },
+    {
+      "name": "Concurrent Mixed",
+      "threads": 4,
+      "ops": 10000,
+      "elapsed_s": 0.053555,
+      "ops_per_sec": 186723.64,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 1600000,
+      "wal_after_bytes": 2400000
+    },
+    {
+      "name": "Latency SET",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.073113,
+      "ops_per_sec": 136774.66,
+      "latency_us": {
+        "avg": 7.21,
+        "p50": 7.00,
+        "p95": 7.92,
+        "p99": 10.58
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "Latency GET",
+      "threads": 1,
+      "ops": 10000,
+      "elapsed_s": 0.005266,
+      "ops_per_sec": 1899109.79,
+      "latency_us": {
+        "avg": 0.44,
+        "p50": 0.42,
+        "p95": 0.50,
+        "p99": 0.58
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP GET (hit)",
+      "threads": 1,
+      "ops": 1000,
+      "elapsed_s": 0.207368,
+      "ops_per_sec": 4822.35,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP GET (hit)",
+      "threads": 2,
+      "ops": 1000,
+      "elapsed_s": 0.106479,
+      "ops_per_sec": 9391.55,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP GET (hit)",
+      "threads": 4,
+      "ops": 1000,
+      "elapsed_s": 0.075183,
+      "ops_per_sec": 13300.86,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP PUT",
+      "threads": 1,
+      "ops": 1000,
+      "elapsed_s": 0.229326,
+      "ops_per_sec": 4360.61,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP PUT",
+      "threads": 2,
+      "ops": 1000,
+      "elapsed_s": 0.116494,
+      "ops_per_sec": 8584.16,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP PUT",
+      "threads": 4,
+      "ops": 1000,
+      "elapsed_s": 0.083475,
+      "ops_per_sec": 11979.70,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP Mixed",
+      "threads": 1,
+      "ops": 1000,
+      "elapsed_s": 0.220369,
+      "ops_per_sec": 4537.84,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP Mixed",
+      "threads": 2,
+      "ops": 1000,
+      "elapsed_s": 0.112816,
+      "ops_per_sec": 8864.01,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    },
+    {
+      "name": "HTTP Mixed",
+      "threads": 4,
+      "ops": 1000,
+      "elapsed_s": 0.079293,
+      "ops_per_sec": 12611.52,
+      "latency_us": {
+        "avg": 0.00,
+        "p50": 0.00,
+        "p95": 0.00,
+        "p99": 0.00
+      },
+      "wal_before_bytes": 0,
+      "wal_after_bytes": 0
+    }
+  ]
+}

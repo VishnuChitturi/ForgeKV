@@ -1,0 +1,117 @@
+/* =============================================================================
+   BenchmarkOverview — Stage 18
+   ============================================================================= */
+
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 1.125rem 1.25rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.meta {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+/* ---- Table ---- */
+.tableWrapper {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.table th,
+.table td {
+  padding: 0.4375rem 0.625rem;
+}
+
+.table thead tr {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.table tbody tr {
+  border-bottom: 1px solid var(--color-surface-subtle);
+}
+
+.table tbody tr:last-child {
+  border-bottom: none;
+}
+
+.table tbody tr:hover {
+  background: var(--color-surface-subtle);
+}
+
+.thLabel {
+  text-align: left;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.thNum {
+  text-align: right;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tdLabel {
+  text-align: left;
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+
+.tdNum {
+  text-align: right;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.opsValue {
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.opsUnit {
+  font-size: 0.6875rem;
+  color: var(--color-text-muted);
+}
+
+/* Missing row */
+.rowMissing td {
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+.tdMissing {
+  text-align: left;
+  color: var(--color-text-muted);
+  font-style: italic;
+}

@@ -1,0 +1,114 @@
+/* =============================================================================
+   PersistenceAnalytics — Stage 18
+   ============================================================================= */
+
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 1.125rem 1.25rem;
+  box-shadow: var(--shadow-sm);
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.title {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  margin: 0;
+}
+
+.badge {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+/* ---- Metric grid ---- */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.875rem;
+}
+
+.metricBlock {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  padding: 0.75rem;
+  background: var(--color-surface-subtle);
+  border-radius: var(--radius-md);
+}
+
+.metricIcon {
+  font-size: 1.25rem;
+  flex-shrink: 0;
+  line-height: 1;
+  margin-top: 0.0625rem;
+}
+
+.metricBody {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.metricLabel {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.metricValue {
+  font-size: 1.0625rem;
+  font-weight: 700;
+  color: var(--color-text-primary);
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.metricSub {
+  font-size: 0.6875rem;
+  color: var(--color-text-muted);
+  margin-top: 0.0625rem;
+}
+
+/* ---- TTL analytics row ---- */
+.ttlRow {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--color-border);
+}
+
+.ttlLabel {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+  flex-shrink: 0;
+}
+
+.ttlDetail {
+  font-size: 0.8125rem;
+  color: var(--color-text-secondary);
+}
