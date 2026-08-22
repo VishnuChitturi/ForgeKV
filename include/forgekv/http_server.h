@@ -66,6 +66,7 @@
 // =============================================================================
 
 #include "forgekv/kv_store.h"
+#include "forgekv/stats.h"
 
 // cpp-httplib — vendored single-header library
 #include "httplib.h"

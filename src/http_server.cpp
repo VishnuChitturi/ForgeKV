@@ -57,6 +57,7 @@
 
 #include "forgekv/http_server.h"
 
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -278,6 +279,58 @@ void HttpServer::register_routes() {
                               httplib::Response&       res) {
         res.status = 200;
         res.set_content("{\"status\":\"ok\"}", "application/json");
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /stats — runtime statistics
+    // -------------------------------------------------------------------------
+    //
+    // Stage 11: returns a JSON object with current operational metrics.
+    //
+    // Response shape:
+    //   {
+    //     "key_count":             <uint64>,
+    //     "get_hits":              <uint64>,
+    //     "get_misses":            <uint64>,
+    //     "set_count":             <uint64>,
+    //     "delete_count":          <uint64>,
+    //     "ttl_set_count":         <uint64>,
+    //     "expired_count":         <uint64>,
+    //     "wal_size_bytes":        <uint64>,
+    //     "uptime_seconds":        <double, 2 decimal places>,
+    //     "last_snapshot_time_us": <uint64, 0 means never>
+    //   }
+    //
+    // Always returns HTTP 200. Internal errors return 500.
+    // No mutation is performed.
+    server_.Get("/stats", [this](const httplib::Request& /*req*/,
+                                 httplib::Response&       res) {
+        try {
+            const forgekv::Stats s = store_.stats();
+
+            // Serialize to JSON manually (consistent with other endpoints).
+            std::ostringstream oss;
+            oss << "{"
+                << "\"key_count\":"              << s.key_count             << ","
+                << "\"get_hits\":"               << s.get_hits              << ","
+                << "\"get_misses\":"             << s.get_misses            << ","
+                << "\"set_count\":"              << s.set_count             << ","
+                << "\"delete_count\":"           << s.delete_count          << ","
+                << "\"ttl_set_count\":"          << s.ttl_set_count         << ","
+                << "\"expired_count\":"          << s.expired_count         << ","
+                << "\"wal_size_bytes\":"         << s.wal_size_bytes        << ","
+                << "\"uptime_seconds\":"         << std::fixed
+                                                 << std::setprecision(2)
+                                                 << s.uptime_seconds        << ","
+                << "\"last_snapshot_time_us\":"  << s.last_snapshot_time_us
+                << "}";
+
+            res.status = 200;
+            res.set_content(oss.str(), "application/json");
+        } catch (const std::exception&) {
+            res.status = 500;
+            res.set_content(json_error("internal server error"), "application/json");
+        }
     });
 }
 

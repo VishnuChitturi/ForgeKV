@@ -1,76 +1,73 @@
 #pragma once
 // =============================================================================
-// ForgeKV — Stage 10: KeyValueStore (TTL / Expiration)
+// ForgeKV — Stage 11: KeyValueStore (Statistics / Observability)
 // =============================================================================
 //
-// Stage 10 adds:
+// Stage 11 adds:
 //
-//   1. set_with_ttl(key, value, ttl_seconds) — set a key with an optional
-//      time-to-live in seconds.  The absolute expiration timestamp is stored
-//      internally as microseconds since Unix epoch (wall clock).
+//   1. Stats struct (see include/forgekv/stats.h) — plain value type returned
+//      by stats(). Fields documented in stats.h.
 //
-//   2. ttl(key) — query the remaining TTL for a key.
-//      Returns:
-//        > 0  — seconds remaining (fractional)
-//        0.0  — key is expired (or will expire imminently)
-//       -1.0  — key exists but is permanent (no TTL set)
-//       -2.0  — key does not exist (or has already expired and been removed)
+//   2. Atomic operation counters — lock-free, independent of the storage mutex:
+//        get_hits_, get_misses_, set_count_, delete_count_,
+//        ttl_set_count_, expired_count_
 //
-//   3. Background cleanup thread — periodically removes expired keys from
-//      in-memory storage and writes WAL DEL records so expiration is durable.
-//      The thread wakes every cleanup_interval_ms milliseconds or immediately
-//      on shutdown.  It is joined in the destructor.
+//   3. Uptime tracking — steady_clock::time_point recorded at construction,
+//      before recover() runs. Uptime is the elapsed time from construction
+//      to the stats() call.
 //
-//   4. Destructor cleanup — the destructor signals the cleanup thread to stop
-//      and joins it before destroying WAL/storage.
+//   4. last_snapshot_time_ — std::atomic<uint64_t> updated only on successful
+//      snapshot(). Stores wall-clock microseconds since Unix epoch. Zero
+//      until the first successful snapshot.
 //
-// TTL semantics:
+//   5. stats() method — acquires shared lock, reads storage size + WAL size,
+//      loads atomic counters into a Stats struct, and returns by value.
 //
-//   - set(key, value)               → permanent; removes any prior TTL.
-//   - set_with_ttl(key, value, ttl) → sets expiry = now + ttl.
-//   - ttl <= 0                      → key is immediately expired/not stored.
-//   - Updating a key with set()     → clears the TTL; key becomes permanent.
-//   - Updating with set_with_ttl()  → replaces the expiry with new value.
+//   6. Recovery guard — the recovering_ flag is set during recover() so that
+//      WAL replay and snapshot loading do NOT increment operation counters.
 //
-// Read-time expiration (safe with shared_mutex):
+// Counter semantics (summary — full details in stats.h):
 //
-//   get() and exists() use Storage::get/exists which check the current time
-//   and return "absent" for expired keys WITHOUT mutating storage.
-//   Physical removal only happens under exclusive lock (background thread or
-//   write operations that encounter an expired key).
+//   set_count      → incremented in set() only
+//   ttl_set_count  → incremented in set_with_ttl() only (when ttl > 0)
+//   delete_count   → incremented in del() only (when key existed)
+//   get_hits       → incremented in get() when value returned
+//   get_misses     → incremented in get() when nullopt returned
+//   expired_count  → incremented in do_expire_pass() for each key expired
+//   key_count      → derived from storage_->size() at stats() call time
 //
-// Background cleanup and WAL durability:
+//   Recovery does NOT increment any of the above counters.
 //
-//   When the background thread removes expired keys, it:
-//   1. Acquires the exclusive lock.
-//   2. Calls storage_->expire_keys(now_us) to remove expired entries.
-//   3. For each removed key, calls wal_->append_del(key) to write a WAL
-//      DEL record.  This ensures that a restart will NOT resurrect the key.
-//   4. Releases the lock.
+// Uptime:
+//   Uses std::chrono::steady_clock (monotonic). Not persisted.
+//   Recorded at the top of the constructor body, before recover().
 //
-// Concurrency model (unchanged from Stage 7):
+// Last snapshot time:
+//   Updated atomically only when snapshot() returns true (success).
+//   Stores wall-clock microseconds since Unix epoch (system_clock).
+//   Zero if no successful snapshot has occurred this process lifetime.
 //
-//   READ operations (get, exists, size, empty, ttl):
-//     → shared_lock (multiple concurrent readers)
+// WAL size:
+//   Obtained via wal_->file_size() inside stats() under the shared lock.
+//   No separate counter is maintained — the WAL is the authoritative source.
 //
-//   WRITE operations (set, set_with_ttl, del, clear, compact, snapshot):
-//     → exclusive lock (single writer, all readers blocked)
+// Concurrency:
+//   - Atomic counters are updated without the storage mutex — they are
+//     independent monotonically increasing values.
+//   - stats() holds the shared lock only long enough to read storage size
+//     and WAL size; it does not block writers.
+//   - last_snapshot_time_ is a standalone atomic<uint64_t>; reading it does
+//     not require the storage lock.
+//   - All counter reads in stats() use memory_order_relaxed because a slightly
+//     stale view is explicitly acceptable for observability data.
 //
-//   Background cleanup:
-//     → exclusive lock (short critical section per cleanup cycle)
-//
-// Thread lifecycle:
-//
-//   The cleanup thread is started in the constructor (after recover()).
-//   It runs until stop_cleanup_ is set.
-//   The destructor: sets stop_cleanup_, notifies the condition variable,
-//   joins the thread. The WAL and storage are destroyed AFTER the thread
-//   has exited, so there is no use-after-free risk.
-//
+// All other semantics (locking model, TTL, background cleanup, recovery) are
+// unchanged from Stage 10.
 // =============================================================================
 
 #include "forgekv/recovery.h"
 #include "forgekv/snapshot.h"
+#include "forgekv/stats.h"
 #include "forgekv/storage.h"
 #include "forgekv/wal.h"
 
@@ -209,6 +206,7 @@ public:
     // Expired keys are excluded from the snapshot.
     // Live expiring keys are stored with their expiry metadata.
     // Returns true on success, false on failure.
+    // Stage 11: updates last_snapshot_time_ on success.
     bool snapshot();
 
     // -------------------------------------------------------------------------
@@ -219,6 +217,17 @@ public:
     // Useful in tests that need to flush expired keys without waiting for the
     // background thread's next wakeup.
     void run_cleanup_now();
+
+    // -------------------------------------------------------------------------
+    // Stage 11: Statistics
+    // -------------------------------------------------------------------------
+
+    // STATS: Return a snapshot of current operational statistics.
+    //
+    // Acquires the shared lock momentarily to read storage size and WAL size.
+    // Atomic counters are read without the storage lock (relaxed order).
+    // Returns a Stats struct by value — safe to use after the lock is released.
+    [[nodiscard]] Stats stats() const;
 
 private:
     // -------------------------------------------------------------------------
@@ -242,6 +251,14 @@ private:
     // MUST be called under the exclusive lock (mutex_).
     // Returns the number of keys expired.
     std::size_t do_expire_pass();
+
+    // ---- Stage 11: Statistics ----
+
+    // Monotonic start time (steady_clock::time_point) recorded at construction
+    // BEFORE recover() runs. Used for uptime_seconds in stats().
+    // Declared first so it is initialized first in every constructor initializer list.
+    std::chrono::steady_clock::time_point start_time_{
+        std::chrono::steady_clock::now()};
 
     // -------------------------------------------------------------------------
     // State
@@ -275,7 +292,24 @@ private:
 
     // The cleanup thread.  Joined in the destructor.
     std::thread cleanup_thread_;
+
+    // Atomic operation counters. Updated without the storage mutex.
+    // All use relaxed memory order; stats() tolerates a slightly stale view.
+    mutable std::atomic<std::uint64_t> stat_get_hits_{0};
+    mutable std::atomic<std::uint64_t> stat_get_misses_{0};
+    std::atomic<std::uint64_t>         stat_set_count_{0};
+    std::atomic<std::uint64_t>         stat_delete_count_{0};
+    std::atomic<std::uint64_t>         stat_ttl_set_count_{0};
+    std::atomic<std::uint64_t>         stat_expired_count_{0};
+
+    // Wall-clock timestamp of the last successful snapshot, as microseconds
+    // since Unix epoch. Zero means no snapshot has ever succeeded.
+    std::atomic<std::uint64_t> last_snapshot_time_us_{0};
+
+    // Recovery guard: true while recover() is running.
+    // When true, set/del/ttl_set counters are suppressed.
+    // Not atomic — only written in the constructor before any threads start.
+    bool recovering_{false};
 };
 
 } // namespace forgekv
-

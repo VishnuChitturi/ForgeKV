@@ -5124,6 +5124,472 @@ TEST(s10_ttl_exactly_zero_not_stored) {
 // End of Stage 10 tests
 // =============================================================================
 
+// =============================================================================
+// Stage 11 Tests — Statistics / Observability
+// =============================================================================
+//
+// Test list:
+//
+//   S11-A.  Initial stats: all counters zero, key_count zero.
+//   S11-B.  Initial key count is zero.
+//   S11-C.  set() increments set_count.
+//   S11-D.  set() updates key_count correctly.
+//   S11-E.  Updating an existing key does not change key_count.
+//   S11-F.  get() hit increments get_hits.
+//   S11-G.  get() miss increments get_misses.
+//   S11-H.  del() on existing key increments delete_count.
+//   S11-I.  del() on missing key does NOT increment delete_count.
+//   S11-J.  set_with_ttl() increments ttl_set_count.
+//   S11-K.  set_with_ttl(ttl<=0) does NOT increment ttl_set_count.
+//   S11-L.  Expiration increments expired_count.
+//   S11-M.  Expired keys disappear from key_count.
+//   S11-N.  WAL size is positive after writes.
+//   S11-O.  uptime_seconds is positive after construction.
+//   S11-P.  last_snapshot_time_us is 0 before any snapshot.
+//   S11-Q.  Successful snapshot updates last_snapshot_time_us.
+//   S11-R.  Compaction changes WAL size (decreases after compact with live keys).
+//   S11-S.  Recovery does NOT inflate set_count, delete_count, ttl_set_count.
+//   S11-T.  clear() updates key_count to zero.
+//   S11-U.  Multiple sets accumulate set_count correctly.
+//   S11-V.  Multiple snapshots each update last_snapshot_time_us.
+//   S11-W.  Concurrent operations and stats() do not race (smoke test).
+//   S11-X.  stats() key_count reflects live keys only (not expired).
+//   S11-Y.  stats() returns Stats struct with correct types.
+//   S11-Z.  uptime_seconds increases over time.
+// =============================================================================
+
+#include "forgekv/stats.h"
+
+// ---------------------------------------------------------------------------
+// Helpers for Stage 11 tests (reuse TEMP_TTL_SNAP and make_ttl_store from S10)
+// ---------------------------------------------------------------------------
+
+// S11-A. Initial stats: all counters zero, key_count zero.
+// ---------------------------------------------------------------------------
+TEST(s11_initial_stats_all_zero) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    const auto s = store.stats();
+    ASSERT_EQ(s.key_count,          std::uint64_t{0});
+    ASSERT_EQ(s.get_hits,           std::uint64_t{0});
+    ASSERT_EQ(s.get_misses,         std::uint64_t{0});
+    ASSERT_EQ(s.set_count,          std::uint64_t{0});
+    ASSERT_EQ(s.delete_count,       std::uint64_t{0});
+    ASSERT_EQ(s.ttl_set_count,      std::uint64_t{0});
+    ASSERT_EQ(s.expired_count,      std::uint64_t{0});
+    ASSERT_EQ(s.last_snapshot_time_us, std::uint64_t{0});
+}
+
+// S11-B. Initial key count is zero.
+// ---------------------------------------------------------------------------
+TEST(s11_initial_key_count_zero) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{0});
+}
+
+// S11-C. set() increments set_count.
+// ---------------------------------------------------------------------------
+TEST(s11_set_increments_set_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("a", "1");
+    ASSERT_EQ(store.stats().set_count, std::uint64_t{1});
+    store.set("b", "2");
+    ASSERT_EQ(store.stats().set_count, std::uint64_t{2});
+    store.set("c", "3");
+    ASSERT_EQ(store.stats().set_count, std::uint64_t{3});
+}
+
+// S11-D. set() updates key_count correctly.
+// ---------------------------------------------------------------------------
+TEST(s11_set_updates_key_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{0});
+    store.set("x", "1");
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{1});
+    store.set("y", "2");
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{2});
+}
+
+// S11-E. Updating an existing key does not change key_count (still 1).
+// ---------------------------------------------------------------------------
+TEST(s11_update_existing_key_no_key_count_change) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("dup", "v1");
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{1});
+    store.set("dup", "v2");
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{1});
+    store.set("dup", "v3");
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{1});
+    // set_count reflects all 3 calls.
+    ASSERT_EQ(store.stats().set_count, std::uint64_t{3});
+}
+
+// S11-F. get() hit increments get_hits.
+// ---------------------------------------------------------------------------
+TEST(s11_get_hit_increments_get_hits) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("k", "v");
+    ASSERT_EQ(store.stats().get_hits, std::uint64_t{0});
+    auto val = store.get("k");
+    ASSERT_HAS_VALUE(val);
+    ASSERT_EQ(store.stats().get_hits,   std::uint64_t{1});
+    ASSERT_EQ(store.stats().get_misses, std::uint64_t{0});
+}
+
+// S11-G. get() miss increments get_misses.
+// ---------------------------------------------------------------------------
+TEST(s11_get_miss_increments_get_misses) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    auto val = store.get("nonexistent");
+    ASSERT_NO_VALUE(val);
+    ASSERT_EQ(store.stats().get_misses, std::uint64_t{1});
+    ASSERT_EQ(store.stats().get_hits,   std::uint64_t{0});
+    // A second miss.
+    (void)store.get("another_missing");
+    ASSERT_EQ(store.stats().get_misses, std::uint64_t{2});
+}
+
+// S11-H. del() on existing key increments delete_count.
+// ---------------------------------------------------------------------------
+TEST(s11_del_existing_increments_delete_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("todel", "v");
+    ASSERT_EQ(store.stats().delete_count, std::uint64_t{0});
+    bool ok = store.del("todel");
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(store.stats().delete_count, std::uint64_t{1});
+}
+
+// S11-I. del() on missing key does NOT increment delete_count.
+// ---------------------------------------------------------------------------
+TEST(s11_del_missing_does_not_increment_delete_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    bool ok = store.del("ghost");
+    ASSERT_FALSE(ok);
+    ASSERT_EQ(store.stats().delete_count, std::uint64_t{0});
+}
+
+// S11-J. set_with_ttl() increments ttl_set_count.
+// ---------------------------------------------------------------------------
+TEST(s11_set_with_ttl_increments_ttl_set_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("ttlkey", "v", 60.0);
+    ASSERT_EQ(store.stats().ttl_set_count, std::uint64_t{1});
+    // set_count must NOT be incremented for set_with_ttl.
+    ASSERT_EQ(store.stats().set_count, std::uint64_t{0});
+}
+
+// S11-K. set_with_ttl(ttl<=0) does NOT increment ttl_set_count.
+// ---------------------------------------------------------------------------
+TEST(s11_set_with_ttl_zero_no_counter) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set_with_ttl("zero", "v", 0.0);
+    ASSERT_EQ(store.stats().ttl_set_count, std::uint64_t{0});
+    store.set_with_ttl("neg", "v", -1.0);
+    ASSERT_EQ(store.stats().ttl_set_count, std::uint64_t{0});
+}
+
+// S11-L. Expiration increments expired_count.
+// ---------------------------------------------------------------------------
+TEST(s11_expiration_increments_expired_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    // Use a very short TTL so the key expires immediately.
+    store.set_with_ttl("expkey", "v", 0.001); // 1ms TTL
+    // Give it time to expire.
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    // Force the expiration pass.
+    store.run_cleanup_now();
+    ASSERT_EQ(store.stats().expired_count, std::uint64_t{1});
+}
+
+// S11-M. Expired keys disappear from key_count.
+// ---------------------------------------------------------------------------
+TEST(s11_expired_keys_not_in_key_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("perm", "v");
+    store.set_with_ttl("temp", "v", 0.001); // expires quickly
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{2});
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    store.run_cleanup_now();
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{1});
+}
+
+// S11-N. WAL size is positive after writes.
+// ---------------------------------------------------------------------------
+TEST(s11_wal_size_positive_after_writes) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("wkey", "wval");
+    ASSERT_TRUE(store.stats().wal_size_bytes > 0);
+}
+
+// S11-O. uptime_seconds is positive after construction.
+// ---------------------------------------------------------------------------
+TEST(s11_uptime_positive) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    // A tiny sleep to ensure at least some time has elapsed.
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    const double uptime = store.stats().uptime_seconds;
+    ASSERT_TRUE(uptime > 0.0);
+}
+
+// S11-P. last_snapshot_time_us is 0 before any snapshot.
+// ---------------------------------------------------------------------------
+TEST(s11_last_snapshot_time_zero_before_snapshot) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    ASSERT_EQ(store.stats().last_snapshot_time_us, std::uint64_t{0});
+}
+
+// S11-Q. Successful snapshot updates last_snapshot_time_us.
+// ---------------------------------------------------------------------------
+TEST(s11_snapshot_updates_last_snapshot_time) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("snap_key", "snap_val");
+
+    const std::uint64_t before = store.stats().last_snapshot_time_us;
+    ASSERT_EQ(before, std::uint64_t{0});
+
+    const bool ok = store.snapshot();
+    ASSERT_TRUE(ok);
+
+    const std::uint64_t after = store.stats().last_snapshot_time_us;
+    ASSERT_TRUE(after > 0u);
+}
+
+// S11-R. Compaction can change WAL size.
+// ---------------------------------------------------------------------------
+TEST(s11_compaction_changes_wal_size) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+
+    // Write many keys to make the WAL large.
+    for (int i = 0; i < 20; ++i) {
+        store.set("key" + std::to_string(i), "val" + std::to_string(i));
+    }
+    // Delete most of them (WAL still has the SET + DEL records).
+    for (int i = 0; i < 18; ++i) {
+        store.del("key" + std::to_string(i));
+    }
+
+    const std::uint64_t size_before = store.stats().wal_size_bytes;
+    ASSERT_TRUE(size_before > 0u);
+
+    // Compact: WAL is rewritten with only 2 live keys.
+    store.compact();
+
+    const std::uint64_t size_after = store.stats().wal_size_bytes;
+    ASSERT_TRUE(size_after > 0u);
+    // After compaction the WAL should be smaller (only 2 live keys remain).
+    ASSERT_TRUE(size_after < size_before);
+
+    // Operation counters must NOT have been reset by compact().
+    // set_count should still be 20, delete_count should be 18.
+    ASSERT_EQ(store.stats().set_count,    std::uint64_t{20});
+    ASSERT_EQ(store.stats().delete_count, std::uint64_t{18});
+}
+
+// S11-S. Recovery does NOT inflate set_count, delete_count, ttl_set_count.
+// ---------------------------------------------------------------------------
+TEST(s11_recovery_does_not_inflate_counters) {
+    TEMP_TTL_SNAP(g);
+    {
+        // First store: write some state.
+        auto store1 = make_ttl_store(g.wal_path);
+        store1.set("a", "1");
+        store1.set("b", "2");
+        store1.set_with_ttl("c", "3", 3600.0);
+        store1.del("a");
+        // Destructor runs; WAL is flushed.
+    }
+    // Second store: recover from the WAL.
+    auto store2 = make_ttl_store(g.wal_path);
+    const auto s = store2.stats();
+    // Recovery should NOT count replayed operations as client operations.
+    ASSERT_EQ(s.set_count,    std::uint64_t{0});
+    ASSERT_EQ(s.delete_count, std::uint64_t{0});
+    ASSERT_EQ(s.ttl_set_count,std::uint64_t{0});
+    // But the live key count should reflect recovered state: b + c = 2.
+    ASSERT_EQ(s.key_count, std::uint64_t{2});
+}
+
+// S11-T. clear() updates key_count to zero.
+// ---------------------------------------------------------------------------
+TEST(s11_clear_updates_key_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("p", "1");
+    store.set("q", "2");
+    store.set("r", "3");
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{3});
+    store.clear();
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{0});
+}
+
+// S11-U. Multiple sets accumulate set_count correctly.
+// ---------------------------------------------------------------------------
+TEST(s11_multiple_sets_accumulate_set_count) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    for (int i = 0; i < 50; ++i) {
+        store.set("k" + std::to_string(i), "v");
+    }
+    ASSERT_EQ(store.stats().set_count, std::uint64_t{50});
+}
+
+// S11-V. Multiple snapshots each update last_snapshot_time_us.
+// ---------------------------------------------------------------------------
+TEST(s11_multiple_snapshots_update_last_snapshot_time) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("k", "v");
+
+    const bool ok1 = store.snapshot();
+    ASSERT_TRUE(ok1);
+    const std::uint64_t t1 = store.stats().last_snapshot_time_us;
+    ASSERT_TRUE(t1 > 0u);
+
+    // Small sleep to ensure the clock advances.
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+
+    store.set("k2", "v2");
+    const bool ok2 = store.snapshot();
+    ASSERT_TRUE(ok2);
+    const std::uint64_t t2 = store.stats().last_snapshot_time_us;
+    // Second snapshot time must be >= first (monotonically non-decreasing).
+    ASSERT_TRUE(t2 >= t1);
+}
+
+// S11-W. Concurrent operations and stats() do not race (smoke test).
+// ---------------------------------------------------------------------------
+TEST(s11_concurrent_ops_and_stats_no_race) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+
+    // Seed a few keys.
+    store.set("base0", "v0");
+    store.set("base1", "v1");
+
+    std::atomic<bool> stop{false};
+    const int N = 4;
+
+    // Writer threads.
+    std::vector<std::thread> writers;
+    for (int t = 0; t < N; ++t) {
+        writers.emplace_back([&store, &stop, t]() {
+            int i = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                store.set("w" + std::to_string(t) + "_" + std::to_string(i), "val");
+                ++i;
+            }
+        });
+    }
+
+    // Reader thread.
+    std::thread reader([&store, &stop]() {
+        while (!stop.load(std::memory_order_relaxed)) {
+            (void)store.get("base0");
+            (void)store.get("missing_key");
+        }
+    });
+
+    // Stats reader thread.
+    std::thread stats_reader([&store, &stop]() {
+        while (!stop.load(std::memory_order_relaxed)) {
+            (void)store.stats();
+        }
+    });
+
+    // Let them run for a short time.
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    stop.store(true, std::memory_order_relaxed);
+
+    for (auto& w : writers) { w.join(); }
+    reader.join();
+    stats_reader.join();
+
+    // Basic sanity: counters are consistent.
+    const auto s = store.stats();
+    ASSERT_TRUE(s.set_count > 0u);
+    ASSERT_TRUE(s.get_hits > 0u);
+    ASSERT_TRUE(s.get_misses > 0u);
+    ASSERT_TRUE(s.key_count > 0u);
+}
+
+// S11-X. stats() key_count reflects live keys only (not expired ones).
+// ---------------------------------------------------------------------------
+TEST(s11_key_count_excludes_expired) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("perm1", "v");
+    store.set("perm2", "v");
+    store.set_with_ttl("exp1", "v", 0.001);
+    store.set_with_ttl("exp2", "v", 0.001);
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{4});
+
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    store.run_cleanup_now();
+
+    ASSERT_EQ(store.stats().key_count, std::uint64_t{2});
+    ASSERT_EQ(store.stats().expired_count, std::uint64_t{2});
+}
+
+// S11-Y. stats() returns a Stats struct with correct types and completeness.
+// ---------------------------------------------------------------------------
+TEST(s11_stats_struct_has_all_fields) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    store.set("k", "v");
+    (void)store.get("k");
+    (void)store.get("missing");
+    store.set_with_ttl("ttl_k", "v", 60.0);
+    const bool snap_ok = store.snapshot();
+    ASSERT_TRUE(snap_ok);
+
+    const forgekv::Stats s = store.stats();
+
+    // Verify all fields are populated and have expected relationships.
+    ASSERT_EQ(s.key_count,     std::uint64_t{2});
+    ASSERT_EQ(s.get_hits,      std::uint64_t{1});
+    ASSERT_EQ(s.get_misses,    std::uint64_t{1});
+    ASSERT_EQ(s.set_count,     std::uint64_t{1});
+    ASSERT_EQ(s.ttl_set_count, std::uint64_t{1});
+    ASSERT_TRUE(s.wal_size_bytes > 0u);
+    ASSERT_TRUE(s.uptime_seconds >= 0.0);
+    ASSERT_TRUE(s.last_snapshot_time_us > 0u);
+    ASSERT_EQ(s.expired_count, std::uint64_t{0});
+    ASSERT_EQ(s.delete_count,  std::uint64_t{0});
+}
+
+// S11-Z. uptime_seconds increases over time.
+// ---------------------------------------------------------------------------
+TEST(s11_uptime_increases_over_time) {
+    TEMP_TTL_SNAP(g);
+    auto store = make_ttl_store(g.wal_path);
+    const double t1 = store.stats().uptime_seconds;
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    const double t2 = store.stats().uptime_seconds;
+    ASSERT_TRUE(t2 > t1);
+}
+
+// =============================================================================
+// End of Stage 11 tests
+// =============================================================================
+
 int main() {
     const auto& tests = test_registry();
     int passed = 0;

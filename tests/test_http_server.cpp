@@ -834,6 +834,291 @@ TEST(h10_overwrite_expiring_with_normal_put) {
 // End of Stage 10 HTTP tests
 // =============================================================================
 
+// =============================================================================
+// Stage 11 HTTP Tests — GET /stats
+// =============================================================================
+//
+//   H11-A.  GET /stats returns HTTP 200.
+//   H11-B.  GET /stats response contains all required JSON fields.
+//   H11-C.  GET /stats reflects correct live key count after PUT.
+//   H11-D.  GET /stats get_hits incremented after successful GET /key/:key.
+//   H11-E.  GET /stats get_misses incremented after GET /key/:key miss.
+//   H11-F.  GET /stats set_count incremented after PUT /key/:key.
+//   H11-G.  GET /stats delete_count incremented after DELETE /key/:key.
+//   H11-H.  GET /stats uptime_seconds is a positive number.
+//   H11-I.  GET /stats wal_size_bytes positive after writes.
+//   H11-J.  GET /stats last_snapshot_time_us is 0 before snapshot,
+//           positive after snapshot.
+//   H11-K.  GET /stats does not return 404 or 500 on empty store.
+//   H11-L.  GET /stats JSON is well-formed (parseable, no trailing text).
+// =============================================================================
+
+// Helper: simple JSON field extractor — finds "field":value and returns
+// the value as a string.  Enough for the integer / double fields we need.
+static std::string extract_json_field(const std::string& body,
+                                       const std::string& field)
+{
+    const std::string needle = "\"" + field + "\":";
+    const auto pos = body.find(needle);
+    if (pos == std::string::npos) return "";
+    std::size_t start = pos + needle.size();
+    // Skip optional leading quote (for string values).
+    const bool is_string = (start < body.size() && body[start] == '"');
+    if (is_string) ++start;
+    std::size_t end = start;
+    while (end < body.size()) {
+        const char c = body[end];
+        if (is_string) {
+            if (c == '"') break;
+        } else {
+            if (c == ',' || c == '}') break;
+        }
+        ++end;
+    }
+    return body.substr(start, end - start);
+}
+
+// ---------------------------------------------------------------------------
+// H11-A. GET /stats returns HTTP 200.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_returns_200) {
+    TempWAL wal("h11a");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+    auto res = cli.Get("/stats");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// H11-B. GET /stats response contains all required JSON fields.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_contains_all_required_fields) {
+    TempWAL wal("h11b");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+    auto res = cli.Get("/stats");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+
+    const std::string& body = res->body;
+    ASSERT_FALSE(extract_json_field(body, "key_count").empty());
+    ASSERT_FALSE(extract_json_field(body, "get_hits").empty());
+    ASSERT_FALSE(extract_json_field(body, "get_misses").empty());
+    ASSERT_FALSE(extract_json_field(body, "set_count").empty());
+    ASSERT_FALSE(extract_json_field(body, "delete_count").empty());
+    ASSERT_FALSE(extract_json_field(body, "ttl_set_count").empty());
+    ASSERT_FALSE(extract_json_field(body, "expired_count").empty());
+    ASSERT_FALSE(extract_json_field(body, "wal_size_bytes").empty());
+    ASSERT_FALSE(extract_json_field(body, "uptime_seconds").empty());
+    ASSERT_FALSE(extract_json_field(body, "last_snapshot_time_us").empty());
+}
+
+// ---------------------------------------------------------------------------
+// H11-C. GET /stats reflects correct live key count after PUT.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_key_count_reflects_puts) {
+    TempWAL wal("h11c");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    // Initially 0.
+    {
+        auto res = cli.Get("/stats");
+        ASSERT_TRUE(res);
+        ASSERT_EQ(extract_json_field(res->body, "key_count"), "0");
+    }
+
+    // PUT two keys.
+    cli.Put("/key/alpha", "val_a", "text/plain");
+    cli.Put("/key/beta",  "val_b", "text/plain");
+
+    {
+        auto res = cli.Get("/stats");
+        ASSERT_TRUE(res);
+        ASSERT_EQ(extract_json_field(res->body, "key_count"), "2");
+    }
+
+    // DELETE one.
+    cli.Delete("/key/alpha");
+
+    {
+        auto res = cli.Get("/stats");
+        ASSERT_TRUE(res);
+        ASSERT_EQ(extract_json_field(res->body, "key_count"), "1");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H11-D. GET /stats get_hits incremented after successful GET /key/:key.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_get_hits_incremented) {
+    TempWAL wal("h11d");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    cli.Put("/key/hit_key", "hit_val", "text/plain");
+
+    // GET an existing key → should increment get_hits.
+    cli.Get("/key/hit_key");
+    cli.Get("/key/hit_key");
+
+    auto stats_res = cli.Get("/stats");
+    ASSERT_TRUE(stats_res);
+    const std::string hits = extract_json_field(stats_res->body, "get_hits");
+    ASSERT_TRUE(std::stoul(hits) >= 2u);
+}
+
+// ---------------------------------------------------------------------------
+// H11-E. GET /stats get_misses incremented after GET /key/:key miss.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_get_misses_incremented) {
+    TempWAL wal("h11e");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    // GET a missing key.
+    cli.Get("/key/no_such_key");
+    cli.Get("/key/also_missing");
+
+    auto stats_res = cli.Get("/stats");
+    ASSERT_TRUE(stats_res);
+    const std::string misses = extract_json_field(stats_res->body, "get_misses");
+    ASSERT_TRUE(std::stoul(misses) >= 2u);
+}
+
+// ---------------------------------------------------------------------------
+// H11-F. GET /stats set_count incremented after PUT /key/:key.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_set_count_incremented) {
+    TempWAL wal("h11f");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    cli.Put("/key/s1", "v1", "text/plain");
+    cli.Put("/key/s2", "v2", "text/plain");
+    cli.Put("/key/s3", "v3", "text/plain");
+
+    auto stats_res = cli.Get("/stats");
+    ASSERT_TRUE(stats_res);
+    const std::string sc = extract_json_field(stats_res->body, "set_count");
+    ASSERT_TRUE(std::stoul(sc) >= 3u);
+}
+
+// ---------------------------------------------------------------------------
+// H11-G. GET /stats delete_count incremented after DELETE /key/:key.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_delete_count_incremented) {
+    TempWAL wal("h11g");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    cli.Put("/key/d1", "v1", "text/plain");
+    cli.Put("/key/d2", "v2", "text/plain");
+    cli.Delete("/key/d1");
+
+    auto stats_res = cli.Get("/stats");
+    ASSERT_TRUE(stats_res);
+    const std::string dc = extract_json_field(stats_res->body, "delete_count");
+    ASSERT_TRUE(std::stoul(dc) >= 1u);
+}
+
+// ---------------------------------------------------------------------------
+// H11-H. GET /stats uptime_seconds is a positive number.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_uptime_is_positive) {
+    TempWAL wal("h11h");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    auto stats_res = cli.Get("/stats");
+    ASSERT_TRUE(stats_res);
+    const std::string uptime_str =
+        extract_json_field(stats_res->body, "uptime_seconds");
+    ASSERT_FALSE(uptime_str.empty());
+    const double uptime = std::stod(uptime_str);
+    ASSERT_TRUE(uptime >= 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// H11-I. GET /stats wal_size_bytes positive after writes.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_wal_size_positive_after_writes) {
+    TempWAL wal("h11i");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    cli.Put("/key/walkey", "walval", "text/plain");
+
+    auto stats_res = cli.Get("/stats");
+    ASSERT_TRUE(stats_res);
+    const std::string ws = extract_json_field(stats_res->body, "wal_size_bytes");
+    ASSERT_TRUE(std::stoul(ws) > 0u);
+}
+
+// ---------------------------------------------------------------------------
+// H11-J. last_snapshot_time_us is 0 before snapshot; positive after.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_snapshot_time_zero_then_positive) {
+    TempWAL wal("h11j");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+
+    // Before snapshot.
+    {
+        auto stats_res = cli.Get("/stats");
+        ASSERT_TRUE(stats_res);
+        const std::string t =
+            extract_json_field(stats_res->body, "last_snapshot_time_us");
+        ASSERT_EQ(t, "0");
+    }
+
+    // Trigger a snapshot via the store directly.
+    fix.store().snapshot();
+
+    // After snapshot.
+    {
+        auto stats_res = cli.Get("/stats");
+        ASSERT_TRUE(stats_res);
+        const std::string t =
+            extract_json_field(stats_res->body, "last_snapshot_time_us");
+        ASSERT_TRUE(std::stoull(t) > 0u);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H11-K. GET /stats does not return 404 or 500 on empty store.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_works_on_empty_store) {
+    TempWAL wal("h11k");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+    auto res = cli.Get("/stats");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+    // key_count should be 0.
+    ASSERT_EQ(extract_json_field(res->body, "key_count"), "0");
+}
+
+// ---------------------------------------------------------------------------
+// H11-L. GET /stats JSON is well-formed: starts with '{', ends with '}'.
+// ---------------------------------------------------------------------------
+TEST(h11_stats_json_well_formed) {
+    TempWAL wal("h11l");
+    HttpTestFixture fix(wal.path);
+    auto cli = fix.make_client();
+    auto res = cli.Get("/stats");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+    ASSERT_FALSE(res->body.empty());
+    ASSERT_EQ(res->body.front(), '{');
+    ASSERT_EQ(res->body.back(),  '}');
+}
+
+// =============================================================================
+// End of Stage 11 HTTP tests
+// =============================================================================
+
 int main() {
     const auto& tests = test_registry();
 

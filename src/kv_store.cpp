@@ -1,45 +1,42 @@
 // =============================================================================
-// ForgeKV — Stage 10: KeyValueStore implementation (TTL / Expiration)
+// ForgeKV — Stage 11: KeyValueStore implementation (Statistics / Observability)
 // =============================================================================
 //
-// Stage 10 adds:
+// Stage 11 adds lightweight runtime statistics. See kv_store.h for the full
+// design notes. Changes relative to Stage 10:
 //
-//   1. set_with_ttl(key, value, ttl_seconds)
-//      - Computes absolute expiration: now + ttl_seconds (as microseconds).
-//      - Writes kOpSetWithExpiry WAL record.
-//      - Calls storage_->set_with_expiry().
-//      - ttl_seconds <= 0: key is not stored (immediately expired).
+//   1. start_time_ captured at the top of every constructor (before recover()).
 //
-//   2. ttl(key)
-//      - Returns kTtlPermanent (-1.0) if key exists and is permanent.
-//      - Returns kTtlNotFound  (-2.0) if key is missing or expired.
-//      - Returns remaining seconds (>=0.0) if key is expiring.
+//   2. recovering_ flag set true during recover(), cleared after.
+//      This suppresses counter increments for WAL replay / snapshot loading.
 //
-//   3. Background cleanup thread.
-//      - Wakes every cleanup_interval_ or on shutdown.
-//      - Calls do_expire_pass() under the exclusive lock.
-//      - do_expire_pass() removes expired keys from storage and writes WAL
-//        DEL records so expirations are durable across restarts.
-//      - Thread is started after recover() returns.
-//      - Thread is stopped/joined in the destructor.
+//   3. set() — increments stat_set_count_ (only when !recovering_).
 //
-//   4. Updated recover():
-//      - Handles kOpSetWithExpiry records from WAL.
-//      - Skips already-expired records during recovery.
-//      - Loads v2 snapshot records with expiry metadata.
+//   4. set_with_ttl() — increments stat_ttl_set_count_ (only when ttl > 0
+//      and !recovering_).
 //
-//   5. Updated compact():
-//      - Excludes expired keys from the compacted WAL.
-//      - Writes SET_WITH_EXPIRY for live expiring keys.
+//   5. get() — increments stat_get_hits_ (value found) or stat_get_misses_
+//      (nullopt). These are client reads; recovery does not call get().
+//      get() is const and uses mutable atomics — relaxed increment is fine.
 //
-//   6. Updated snapshot():
-//      - Excludes expired keys.
-//      - Preserves expiry metadata for live expiring keys.
+//   6. del() — increments stat_delete_count_ when the key existed and was
+//      deleted. Does NOT count deletions of non-existent keys.
+//      Does NOT count background expiration deletions (those go to
+//      stat_expired_count_).
 //
-// Locking model (unchanged from Stage 7):
-//   READ ops:   shared_lock (get, exists, size, empty, ttl)
-//   WRITE ops:  exclusive lock (set, set_with_ttl, del, clear, compact, snapshot)
-//   CLEANUP:    exclusive lock (short pass, writes WAL DEL records)
+//   7. do_expire_pass() — increments stat_expired_count_ by the number of
+//      keys actually removed by expiration.
+//
+//   8. snapshot() — on success, records current wall-clock time in
+//      last_snapshot_time_us_.
+//
+//   9. stats() — assembles and returns a Stats struct. Acquires the shared
+//      lock to read storage_.size() and wal_->file_size() atomically with
+//      respect to writers, then reads atomic counters without the lock.
+//
+// All counter increments use memory_order_relaxed — the counters are
+// independent and do not synchronise any other state. stats() reads them
+// with memory_order_relaxed too; a slightly stale view is acceptable.
 // =============================================================================
 
 #include "forgekv/kv_store.h"
@@ -59,7 +56,7 @@ namespace forgekv {
 static constexpr const char* kDefaultWalPath = "forgekv.wal";
 
 // =============================================================================
-// Time helper
+// Time helpers
 // =============================================================================
 
 // Returns current wall-clock time as microseconds since Unix epoch.
@@ -109,11 +106,15 @@ static void start_cleanup_thread(
 // =============================================================================
 
 KeyValueStore::KeyValueStore()
-    : storage_(std::make_unique<InMemoryStorage>()),
+    : start_time_(std::chrono::steady_clock::now()),  // Stage 11: uptime anchor
+      storage_(std::make_unique<InMemoryStorage>()),
       wal_(std::make_unique<WAL>(kDefaultWalPath)),
       snapshot_manager_(kDefaultWalPath)
 {
+    recovering_ = true;
     recover();
+    recovering_ = false;
+
     start_cleanup_thread(
         cleanup_thread_, stop_cleanup_,
         cleanup_cv_mutex_, cleanup_cv_,
@@ -130,7 +131,8 @@ KeyValueStore::KeyValueStore()
 
 KeyValueStore::KeyValueStore(std::unique_ptr<Storage> storage,
                              std::unique_ptr<WAL>     wal)
-    : storage_(std::move(storage)),
+    : start_time_(std::chrono::steady_clock::now()),  // Stage 11: uptime anchor
+      storage_(std::move(storage)),
       wal_(std::move(wal)),
       snapshot_manager_("")
 {
@@ -141,7 +143,11 @@ KeyValueStore::KeyValueStore(std::unique_ptr<Storage> storage,
         throw std::invalid_argument("KeyValueStore: wal must not be null");
     }
     snapshot_manager_ = SnapshotManager(wal_->path());
+
+    recovering_ = true;
     recover();
+    recovering_ = false;
+
     start_cleanup_thread(
         cleanup_thread_, stop_cleanup_,
         cleanup_cv_mutex_, cleanup_cv_,
@@ -157,14 +163,19 @@ KeyValueStore::KeyValueStore(std::unique_ptr<Storage> storage,
 // =============================================================================
 
 KeyValueStore::KeyValueStore(std::unique_ptr<Storage> storage)
-    : storage_(std::move(storage)),
+    : start_time_(std::chrono::steady_clock::now()),  // Stage 11: uptime anchor
+      storage_(std::move(storage)),
       wal_(std::make_unique<WAL>(kDefaultWalPath)),
       snapshot_manager_(kDefaultWalPath)
 {
     if (!storage_) {
         throw std::invalid_argument("KeyValueStore: storage must not be null");
     }
+
+    recovering_ = true;
     recover();
+    recovering_ = false;
+
     start_cleanup_thread(
         cleanup_thread_, stop_cleanup_,
         cleanup_cv_mutex_, cleanup_cv_,
@@ -198,7 +209,8 @@ KeyValueStore::~KeyValueStore()
 // =============================================================================
 
 KeyValueStore::KeyValueStore(KeyValueStore&& other) noexcept
-    : snapshot_manager_()
+    : start_time_(std::chrono::steady_clock::now()),  // new uptime for the moved-to object
+      snapshot_manager_()
 {
     // Stop the other's cleanup thread before moving its state.
     other.stop_cleanup_.store(true, std::memory_order_relaxed);
@@ -213,6 +225,23 @@ KeyValueStore::KeyValueStore(KeyValueStore&& other) noexcept
     snapshot_manager_ = std::move(other.snapshot_manager_);
     cleanup_interval_ = other.cleanup_interval_;
 
+    // Transfer stats counters.
+    stat_get_hits_.store(other.stat_get_hits_.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+    stat_get_misses_.store(other.stat_get_misses_.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+    stat_set_count_.store(other.stat_set_count_.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+    stat_delete_count_.store(other.stat_delete_count_.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+    stat_ttl_set_count_.store(other.stat_ttl_set_count_.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+    stat_expired_count_.store(other.stat_expired_count_.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+    last_snapshot_time_us_.store(
+        other.last_snapshot_time_us_.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
+
     // Start a new cleanup thread for the moved-to object.
     stop_cleanup_.store(false, std::memory_order_relaxed);
     start_cleanup_thread(
@@ -226,8 +255,13 @@ KeyValueStore::KeyValueStore(KeyValueStore&& other) noexcept
 }
 
 // =============================================================================
-// recover — snapshot-aware startup recovery (Stage 10 extended)
+// recover — snapshot-aware startup recovery (unchanged from Stage 10)
 // =============================================================================
+//
+// NOTE (Stage 11): This method runs with recovering_ == true, set in the
+// constructor before recover() is called.  The set/del/ttl_set operations
+// inside the replay callbacks check recovering_ and do NOT increment client
+// operation counters.
 //
 // Handles:
 //   A. kOpSet               → permanent key
@@ -328,6 +362,7 @@ void KeyValueStore::recover()
 //
 // MUST be called under the exclusive lock.
 // Returns the number of keys expired.
+// Stage 11: increments stat_expired_count_ by the number of keys removed.
 
 std::size_t KeyValueStore::do_expire_pass()
 {
@@ -342,6 +377,13 @@ std::size_t KeyValueStore::do_expire_pass()
             std::cerr << "[ForgeKV] WARNING: cleanup WAL write failed for key '"
                       << key << "': " << e.what() << "\n";
         }
+    }
+
+    // Stage 11: count expired keys (NOT counted as explicit deletions).
+    if (!expired_keys.empty()) {
+        stat_expired_count_.fetch_add(
+            static_cast<std::uint64_t>(expired_keys.size()),
+            std::memory_order_relaxed);
     }
 
     return expired_keys.size();
@@ -360,17 +402,27 @@ void KeyValueStore::run_cleanup_now()
 // =============================================================================
 // set — permanent upsert
 // =============================================================================
+//
+// Stage 11: increments stat_set_count_ unless recovering_.
 
 void KeyValueStore::set(const std::string& key, const std::string& value)
 {
     std::unique_lock lock(mutex_);
     wal_->append_set(key, value);
     storage_->set(key, value);
+
+    // Count client-initiated sets only (not recovery replays).
+    if (!recovering_) {
+        stat_set_count_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // =============================================================================
 // set_with_ttl — expiring upsert
 // =============================================================================
+//
+// Stage 11: increments stat_ttl_set_count_ when the key is actually stored
+// (ttl_seconds > 0) and not during recovery.
 
 void KeyValueStore::set_with_ttl(const std::string& key,
                                   const std::string& value,
@@ -389,21 +441,40 @@ void KeyValueStore::set_with_ttl(const std::string& key,
     std::unique_lock lock(mutex_);
     wal_->append_set_with_expiry(key, value, expires_at_us);
     storage_->set_with_expiry(key, value, expires_at_us);
+
+    // Count client-initiated TTL sets only (not recovery replays).
+    if (!recovering_) {
+        stat_ttl_set_count_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // =============================================================================
 // get — return value for non-expired key
 // =============================================================================
+//
+// Stage 11: increments stat_get_hits_ on success, stat_get_misses_ on miss.
+// get() is a read operation; recovery does not call get().
 
 std::optional<std::string> KeyValueStore::get(const std::string& key) const
 {
     std::shared_lock lock(mutex_);
-    return storage_->get(key);
+    auto result = storage_->get(key);
+
+    if (result.has_value()) {
+        stat_get_hits_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        stat_get_misses_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    return result;
 }
 
 // =============================================================================
 // del — delete key (including any TTL)
 // =============================================================================
+//
+// Stage 11: increments stat_delete_count_ when the key existed and was
+// deleted. Missing-key deletions are NOT counted.
 
 bool KeyValueStore::del(const std::string& key)
 {
@@ -415,6 +486,12 @@ bool KeyValueStore::del(const std::string& key)
     }
     wal_->append_del(key);
     storage_->del(key);
+
+    // Count explicit client deletions only (not recovery or expiration).
+    if (!recovering_) {
+        stat_delete_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     return true;
 }
 
@@ -494,10 +571,8 @@ void KeyValueStore::clear()
 // compact — rewrite WAL with only live state
 // =============================================================================
 //
-// Stage 10 changes:
-//   - Uses get_all_with_expiry() to get live entries WITH expiry metadata.
-//   - Writes SET_WITH_EXPIRY for expiring keys, SET for permanent keys.
-//   - Expired keys are automatically excluded (get_all_with_expiry filters them).
+// Stage 11: compact() does NOT reset any statistics counters.
+// WAL size changes naturally after rewrite; stats() will reflect the new size.
 
 void KeyValueStore::compact()
 {
@@ -535,9 +610,8 @@ void KeyValueStore::compact()
 // snapshot — checkpoint full state to disk
 // =============================================================================
 //
-// Stage 10 changes:
-//   - Uses get_all_with_expiry() — excludes expired keys.
-//   - Passes StoreEntry records to SnapshotManager::save() (v2 format).
+// Stage 11: updates last_snapshot_time_us_ atomically on success.
+// last_snapshot_time_us_ is NOT updated on failure.
 
 bool KeyValueStore::snapshot()
 {
@@ -554,6 +628,9 @@ bool KeyValueStore::snapshot()
         // 3. Write snapshot v2.
         snapshot_manager_.save(wal_offset, records);
 
+        // Stage 11: record the wall-clock time of this successful snapshot.
+        last_snapshot_time_us_.store(current_time_us(), std::memory_order_relaxed);
+
         return true;
 
     } catch (const std::exception& e) {
@@ -563,6 +640,43 @@ bool KeyValueStore::snapshot()
         std::cerr << "[ForgeKV] ERROR: snapshot() failed (unknown exception)\n";
         return false;
     }
+}
+
+// =============================================================================
+// stats — assemble and return a Stats snapshot
+// =============================================================================
+//
+// Acquires the shared lock to read storage size and WAL size (both derived
+// from live storage state). Atomic counters are read without the lock.
+//
+// The Stats struct is returned by value; the caller owns it entirely.
+
+Stats KeyValueStore::stats() const
+{
+    Stats s;
+
+    // Read storage-derived metrics under shared lock.
+    {
+        std::shared_lock lock(mutex_);
+        s.key_count      = static_cast<std::uint64_t>(storage_->size());
+        s.wal_size_bytes = wal_->file_size();
+    }
+
+    // Read atomic counters (relaxed — slightly stale values are acceptable).
+    s.get_hits    = stat_get_hits_.load(std::memory_order_relaxed);
+    s.get_misses  = stat_get_misses_.load(std::memory_order_relaxed);
+    s.set_count   = stat_set_count_.load(std::memory_order_relaxed);
+    s.delete_count= stat_delete_count_.load(std::memory_order_relaxed);
+    s.ttl_set_count  = stat_ttl_set_count_.load(std::memory_order_relaxed);
+    s.expired_count  = stat_expired_count_.load(std::memory_order_relaxed);
+    s.last_snapshot_time_us =
+        last_snapshot_time_us_.load(std::memory_order_relaxed);
+
+    // Compute uptime from monotonic clock.
+    const auto elapsed = std::chrono::steady_clock::now() - start_time_;
+    s.uptime_seconds = std::chrono::duration<double>(elapsed).count();
+
+    return s;
 }
 
 } // namespace forgekv
